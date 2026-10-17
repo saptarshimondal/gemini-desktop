@@ -6,10 +6,12 @@ on:
       - main
   # Manually build and upload packages for an existing release tag
   # (e.g. to backfill assets for a release whose build failed).
+  # Accepts either the bare version (0.7.0) or the full tag
+  # (gemini-desktop-v0.7.0).
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing release tag to build and upload assets for (e.g. 0.7.0)'
+        description: 'Release to build for (e.g. 0.7.0 or gemini-desktop-v0.7.0)'
         required: true
         type: string
 
@@ -38,12 +40,32 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || needs.release-please.outputs.tag_name }}
     steps:
+      - name: Resolve release tag
+        id: release
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$INPUT_TAG"
+            # Accept both "0.7.0" and "gemini-desktop-v0.7.0"
+            case "$tag" in
+              *-v[0-9]*) ;;
+              v[0-9]*)   tag="gemini-desktop-$tag" ;;
+              [0-9]*)    tag="gemini-desktop-v$tag" ;;
+            esac
+          else
+            tag="$RELEASE_TAG"
+          fi
+          echo "Resolved release tag: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.sha }}
+          ref: ${{ steps.release.outputs.tag }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -59,7 +81,7 @@ jobs:
 
       - name: Upload release assets (DEB & Snap, amd64)
         run: |
-          gh release upload "$RELEASE_TAG" \
+          gh release upload "${{ steps.release.outputs.tag }}" \
             dist/*.deb dist/*.snap \
             --repo "$GITHUB_REPOSITORY" --clobber
 
@@ -70,12 +92,32 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || needs.release-please.outputs.tag_name }}
     steps:
+      - name: Resolve release tag
+        id: release
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$INPUT_TAG"
+            # Accept both "0.7.0" and "gemini-desktop-v0.7.0"
+            case "$tag" in
+              *-v[0-9]*) ;;
+              v[0-9]*)   tag="gemini-desktop-$tag" ;;
+              [0-9]*)    tag="gemini-desktop-v$tag" ;;
+            esac
+          else
+            tag="$RELEASE_TAG"
+          fi
+          echo "Resolved release tag: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.sha }}
+          ref: ${{ steps.release.outputs.tag }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -104,6 +146,6 @@ jobs:
 
       - name: Upload release assets (DEB & Snap, arm64)
         run: |
-          gh release upload "$RELEASE_TAG" \
+          gh release upload "${{ steps.release.outputs.tag }}" \
             dist/*.deb dist/*.snap \
             --repo "$GITHUB_REPOSITORY" --clobber
