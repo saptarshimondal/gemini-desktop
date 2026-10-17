@@ -4,6 +4,14 @@ on:
   push:
     branches:
       - main
+  # Manually build and upload packages for an existing release tag
+  # (e.g. to backfill assets for a release whose build failed).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to build and upload assets for (e.g. 0.7.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -11,6 +19,7 @@ permissions:
 
 jobs:
   release-please:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
@@ -24,14 +33,17 @@ jobs:
 
   build-amd64:
     needs: release-please
-    if: ${{ needs.release-please.outputs.release_created }}
+    if: ${{ always() && (needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || needs.release-please.outputs.tag_name }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.sha }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -47,20 +59,23 @@ jobs:
 
       - name: Upload release assets (DEB & Snap, amd64)
         run: |
-          gh release upload ${{ needs.release-please.outputs.tag_name }} \
+          gh release upload "$RELEASE_TAG" \
             dist/*.deb dist/*.snap \
             --repo "$GITHUB_REPOSITORY" --clobber
 
   build-arm64:
     needs: release-please
-    if: ${{ needs.release-please.outputs.release_created }}
+    if: ${{ always() && (needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-24.04-arm
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || needs.release-please.outputs.tag_name }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.sha }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -69,9 +84,11 @@ jobs:
           cache: 'npm'
 
       # arm64 has no prebuilt electron-builder snap template, so the build
-      # falls back to invoking the snapcraft CLI.
+      # falls back to invoking the snapcraft CLI. Snapcraft 9 dropped support
+      # for the core20 base used by the electron-builder snap template —
+      # pin to the 8.x channel, the last that supports core20.
       - name: Install snapcraft
-        run: sudo snap install snapcraft --classic
+        run: sudo snap install snapcraft --classic --channel=8.x/stable
 
       - name: Install dependencies
         run: npm ci
@@ -81,6 +98,6 @@ jobs:
 
       - name: Upload release assets (DEB & Snap, arm64)
         run: |
-          gh release upload ${{ needs.release-please.outputs.tag_name }} \
+          gh release upload "$RELEASE_TAG" \
             dist/*.deb dist/*.snap \
             --repo "$GITHUB_REPOSITORY" --clobber
