@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/saptarshimondal/gemini-desktop/compare/gemini-desktop-v0.7.0...gemini-desktop-v0.7.1) (2026-10-17)
+
+
+### Bug Fixes
+
+* **deb:** refresh icon/desktop caches and ship multi-size icons ([8187f37](https://github.com/saptarshimondal/gemini-desktop/commit/8187f37919b20ee54dc037a39d044c36884ca4d0))
+
 ## [0.7.0](https://github.com/saptarshimondal/gemini-desktop/compare/gemini-desktop-v0.6.0...gemini-desktop-v0.7.0) (2026-10-17)
 
 
