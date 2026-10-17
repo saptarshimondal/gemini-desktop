@@ -11,6 +11,7 @@
     "build:deb": "electron-builder --linux deb --publish never",
     "build:snap": "electron-builder --linux snap --publish never",
     "build:all": "electron-builder --linux deb snap --publish never",
+    "generate:icons": "python3 scripts/generate-icons.py",
     "screenshot": "TEST_SCREENSHOT=1 electron ."
   },
   "build": {
@@ -24,11 +25,13 @@
       ],
       "category": "Utility",
       "artifactName": "${name}_${version}_linux_${arch}.${ext}",
-      "icon": "icon512.png"
+      "icon": "assets/icons"
     },
     "deb": {
       "packageName": "gemini-desktop",
-      "maintainer": "Saptarshi Mondal <mondalsaptarshi7@gmail.com>"
+      "maintainer": "Saptarshi Mondal <mondalsaptarshi7@gmail.com>",
+      "afterInstall": "scripts/after-install.sh",
+      "afterRemove": "scripts/after-remove.sh"
     },
     "snap": {
       "confinement": "strict",

@@ -65,6 +65,13 @@ npm run build:all
 
 Packages are written to the `dist/` directory.
 
+The application icons live in `assets/icons/`. If you change `icon.png`, regenerate
+the multi-resolution icon set (requires `python3` with `Pillow`):
+
+```bash
+npm run generate:icons
+```
+
 ## Updating the source code
 
 Simply pull the latest version of main and install any changed dependencies:
