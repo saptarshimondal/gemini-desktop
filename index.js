@@ -9,7 +9,6 @@ let wasOffline = false;
 const appURL = 'https://gemini.google.com'
 const icon = nativeImage.createFromPath(join(__dirname, 'icon.png'));
 const isTray = process.argv.includes('--tray');
-const snapPath = process.env.SNAP
 const snapUserData = process.env.SNAP_USER_DATA
 const isScreenshotMode = process.env.TEST_SCREENSHOT === '1';
 const screenshotPath = process.env.SCREENSHOT_PATH || 'screenshot.png';
@@ -32,7 +31,7 @@ function handleAutoStartChange() {
       fs.mkdirSync(snapUserData + '/.config/autostart', { recursive: true });
     }
     if (!fs.existsSync(snapUserData + '/.config/autostart/gemini-desktop.desktop')) {
-      fs.copyFileSync(snapPath + '/com.github.kenvandine.gemini-desktop-autostart.desktop', snapUserData + '/.config/autostart/gemini-desktop.desktop');
+      fs.copyFileSync(join(__dirname, 'com.github.saptarshimondal.gemini-desktop-autostart.desktop'), snapUserData + '/.config/autostart/gemini-desktop.desktop');
     }
   } else {
     console.log("Disabling autostart");
