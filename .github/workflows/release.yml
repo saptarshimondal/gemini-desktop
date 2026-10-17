@@ -125,27 +125,18 @@ jobs:
           node-version: 20
           cache: 'npm'
 
-      # arm64 has no prebuilt electron-builder snap template, so the build
-      # falls back to invoking the snapcraft CLI. Snapcraft 9 dropped support
-      # for the core20 base used by the electron-builder snap template —
-      # pin to the 8.x channel, the last that supports core20. Remove any
-      # pre-installed snapcraft first so the channel switch actually applies.
-      - name: Install snapcraft 8.x
-        run: |
-          sudo snap remove snapcraft || true
-          sudo snap install snapcraft --classic --channel=8.x/stable
-          snapcraft --version
-          snapcraft --version | grep -q '^snapcraft 8\.' \
-            || { echo "ERROR: snapcraft 8.x is not active"; exit 1; }
-
       - name: Install dependencies
         run: npm ci
 
-      - name: Build DEB and Snap packages
-        run: npm run build:all
+      # Only the .deb is built for arm64. electron-builder has no prebuilt snap
+      # template for arm64, so it would fall back to a legacy core20 snap built
+      # by the snapcraft CLI — which is not available/supported on the Ubuntu
+      # 24.04 runner. arm64 users install the .deb.
+      - name: Build DEB package
+        run: npm run build:deb
 
-      - name: Upload release assets (DEB & Snap, arm64)
+      - name: Upload release assets (DEB, arm64)
         run: |
           gh release upload "${{ steps.release.outputs.tag }}" \
-            dist/*.deb dist/*.snap \
+            dist/*.deb \
             --repo "$GITHUB_REPOSITORY" --clobber

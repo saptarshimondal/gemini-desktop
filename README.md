@@ -12,6 +12,9 @@ This project and its contributors are not affiliated with Google. This is simply
 Download the latest `.deb` or `.snap` package from the
 [GitHub Releases](https://github.com/saptarshimondal/gemini-desktop/releases) page.
 
+Both `amd64` and `arm64` `.deb` packages are provided. `.snap` packages are
+currently published for `amd64` only — `arm64` users should install the `.deb`.
+
 ### Debian / Ubuntu
 
 ```bash
