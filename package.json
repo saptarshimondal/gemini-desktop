@@ -1,37 +1,56 @@
 {
   "name": "gemini-desktop",
   "title": "Gemini Desktop",
-  "version": "@@VERSION@@",
+  "version": "0.6.0",
+  "desktopName": "gemini-desktop",
   "description": "Unofficial Web app for Google Gemini providing the desktop user experience you would expect on Ubuntu or any other Linux desktop.",
   "main": "index.js",
   "scripts": {
     "start": "electron .",
     "build": "electron-builder --publish never",
+    "build:deb": "electron-builder --linux deb --publish never",
+    "build:snap": "electron-builder --linux snap --publish never",
+    "build:all": "electron-builder --linux deb snap --publish never",
     "screenshot": "TEST_SCREENSHOT=1 electron ."
   },
   "build": {
     "asar": false,
+    "productName": "Gemini Desktop",
+    "appId": "com.github.saptarshimondal.gemini-desktop",
     "linux": {
       "target": [
-	      "dir"
+        "deb",
+        "snap"
       ],
       "category": "Utility",
-      "artifactName": "${name}_${version}_linux.${ext}"
+      "artifactName": "${name}_${version}_linux_${arch}.${ext}",
+      "icon": "icon512.png"
+    },
+    "deb": {
+      "packageName": "gemini-desktop",
+      "maintainer": "Saptarshi Mondal <mondalsaptarshi7@gmail.com>"
+    },
+    "snap": {
+      "confinement": "strict",
+      "plugs": [
+        "default",
+        "audio-record"
+      ]
     },
     "extraFiles": [
-      "com.github.kenvandine.${name}.desktop"
+      "com.github.saptarshimondal.${name}.desktop"
     ]
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kenvandine/gemini-desktop.git"
+    "url": "git+https://github.com/saptarshimondal/gemini-desktop.git"
   },
-  "author": "Ken VanDine",
+  "author": "Saptarshi Mondal <mondalsaptarshi7@gmail.com>",
   "license": "GPL-3.0",
   "bugs": {
-    "url": "https://github.com/kenvandine/gemini-desktop/issues"
+    "url": "https://github.com/saptarshimondal/gemini-desktop/issues"
   },
-  "homepage": "https://github.com/kenvandine/gemini-desktop#readme",
+  "homepage": "https://github.com/saptarshimondal/gemini-desktop#readme",
   "devDependencies": {
     "electron": "^40.2.1",
     "electron-builder": "^26.7.0",

@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build-amd64:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build DEB and Snap packages
+        run: npm run build:all
+
+      - name: Upload release assets (DEB & Snap, amd64)
+        run: |
+          gh release upload ${{ needs.release-please.outputs.tag_name }} \
+            dist/*.deb dist/*.snap \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+  build-arm64:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created }}
+    runs-on: ubuntu-24.04-arm
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      # arm64 has no prebuilt electron-builder snap template, so the build
+      # falls back to invoking the snapcraft CLI.
+      - name: Install snapcraft
+        run: sudo snap install snapcraft --classic
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build DEB and Snap packages
+        run: npm run build:all
+
+      - name: Upload release assets (DEB & Snap, arm64)
+        run: |
+          gh release upload ${{ needs.release-please.outputs.tag_name }} \
+            dist/*.deb dist/*.snap \
+            --repo "$GITHUB_REPOSITORY" --clobber
