@@ -270,6 +270,17 @@ function createWindow () {
 
   win.loadURL(appURL);
 
+  // Reset find bar on navigation
+  const sendFindReset = () => {
+    if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
+      win.webContents.send('gemini-find:reset');
+    }
+  };
+  win.webContents.on('did-navigate', sendFindReset);
+  win.webContents.on('did-navigate-in-page', (event, url, isMainFrame) => {
+    if (isMainFrame) sendFindReset();
+  });
+
   win.webContents.on('did-finish-load', () => {
     if (isScreenshotMode) {
       console.log('Screenshot mode: waiting 5 seconds for content to render...');
@@ -392,10 +403,39 @@ function createWindow () {
   });
 
   win.webContents.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown') return;
+
+    // Ctrl+R: Reload
     if (input.control && input.key.toLowerCase() === 'r') {
       console.log('Pressed Control+R')
       event.preventDefault()
       win.loadURL(appURL);
+      return;
+    }
+
+    // Ctrl+F: Find in conversation
+    if (input.control && !input.alt && input.key.toLowerCase() === 'f') {
+      event.preventDefault();
+      try {
+        win.webContents.send('gemini-find:toggle');
+      } catch (e) {
+        console.warn('gemini-find:toggle send failed', e);
+      }
+      return;
+    }
+
+    // F3 / Ctrl+G (Shift for previous)
+    if (
+      input.key === 'F3' ||
+      (input.control && !input.alt && input.key.toLowerCase() === 'g')
+    ) {
+      event.preventDefault();
+      try {
+        win.webContents.send('gemini-find:step', { forward: !input.shift });
+      } catch (e) {
+        console.warn('gemini-find:step send failed', e);
+      }
+      return;
     }
   })
 }
