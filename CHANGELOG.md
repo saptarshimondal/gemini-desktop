@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/saptarshimondal/gemini-desktop/compare/gemini-desktop-v0.7.1...gemini-desktop-v0.8.0) (2026-10-18)
+
+
+### Features
+
+* implement in-page find functionality with custom toolbar and text stream mapping ([e283669](https://github.com/saptarshimondal/gemini-desktop/commit/e2836690036701deb02c1a5fb9e028b10e976d6d))
+
 ## [0.7.1](https://github.com/saptarshimondal/gemini-desktop/compare/gemini-desktop-v0.7.0...gemini-desktop-v0.7.1) (2026-10-17)
 
 
