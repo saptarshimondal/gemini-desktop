@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/saptarshimondal/gemini-desktop/compare/gemini-desktop-v0.8.0...gemini-desktop-v0.8.1) (2026-10-18)
+
+
+### Bug Fixes
+
+* add preload script for find-in-page functionality with custom UI toolbar ([7f96d84](https://github.com/saptarshimondal/gemini-desktop/commit/7f96d84fa2536da508dac0e1f6edfe1e1827d504))
+
 ## [0.8.0](https://github.com/saptarshimondal/gemini-desktop/compare/gemini-desktop-v0.7.1...gemini-desktop-v0.8.0) (2026-10-18)
 
 
