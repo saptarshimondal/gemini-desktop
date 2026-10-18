@@ -405,41 +405,115 @@ function stopThemeObserver() {
 // Scope discovery
 // ---------------------------------------------------------------------------
 
-function findConversationScope() {
-  const candidates = [
-    '[role="log"]',
-    'main [data-message-author-role] article, main [data-message-author-role], main [role="article"]',
-    'div[role="main"] [data-message-id], [data-message-id]',
-    'c-wiz[data-conversation-id] [data-message-id]',
-    'div.chat-history',
-    'div.conversation-container',
-    'main',
-  ];
+// Elements that identify a chat message. Gemini uses user-query/model-response/
+// message-content; other apps use data-message-* attributes.
+const MESSAGE_SELECTORS = [
+  'user-query',
+  'model-response',
+  '[data-message-id]',
+  '[data-message-author-role]',
+  'article',
+].join(', ');
 
-  for (let i = 0; i < candidates.length; i++) {
+// Nearest ancestor (below body) whose overflow makes it the message scroller.
+function findScrollContainer(el) {
+  let node = el;
+  while (node && node !== document.body && node !== document.documentElement) {
     try {
-      const el = document.querySelector(candidates[i]);
-      if (el && el.childNodes.length > 0) {
-        // Prefer elements that actually contain message-like nodes
-        const hasMessages = el.querySelector('[data-message-id], [role="user"], [role="assistant"]');
-        if (hasMessages || el.scrollHeight > 100) {
-          return el;
-        }
-      }
+      const st = window.getComputedStyle(node);
+      if (st.overflowY === 'auto' || st.overflowY === 'scroll') return node;
     } catch (e) {
-      // skip
+      // ignore
     }
+    node = node.parentElement;
   }
-
   return null;
 }
 
+// Resolve the element the search runs over. Rules, in order:
+//  1. With messages on the page, pick the scroll container (or smallest common
+//     ancestor) that holds ALL of them -- never a single message, never the
+//     sidebar/composer that live outside the message list.
+//  2. Empty conversation: the main column, found via the composer's ancestor
+//     chain (skips the left sidebar).
+//  3. Last resort: <main>, then body.
+function findConversationScope() {
+  let messages = [];
+  try {
+    messages = Array.prototype.slice.call(
+      document.querySelectorAll(MESSAGE_SELECTORS)
+    ).filter((m) => !inFindHost(m));
+  } catch (e) {
+    messages = [];
+  }
+
+  if (messages.length > 0) {
+    const first = messages[0];
+    const last = messages[messages.length - 1];
+
+    // 1a. The scroll container that contains every message.
+    try {
+      const scroller = findScrollContainer(last);
+      if (
+        scroller &&
+        !inFindHost(scroller) &&
+        scroller.contains(first) &&
+        scroller.contains(last)
+      ) {
+        const inside = scroller.querySelectorAll(MESSAGE_SELECTORS).length;
+        if (inside >= messages.length) return scroller;
+      }
+    } catch (e) {
+      // fall through
+    }
+
+    // 1b. Smallest common ancestor of the first and last message.
+    try {
+      let node = first.parentElement;
+      while (node && node !== document.body && node !== document.documentElement) {
+        if (node.contains(last) && !inFindHost(node)) return node;
+        node = node.parentElement;
+      }
+      if (first.parentElement) return first.parentElement;
+    } catch (e) {
+      // fall through
+    }
+  }
+
+  // 2. Empty conversation: main column via the composer's ancestor chain.
+  try {
+    const composer = document.querySelector(
+      'textarea, [contenteditable]:not([contenteditable="false"])'
+    );
+    if (composer) {
+      const minLeft = Math.max(40, window.innerWidth * 0.08);
+      let el = composer.parentElement;
+      let chosen = null;
+      while (el && el !== document.body && el !== document.documentElement) {
+        const r = el.getBoundingClientRect();
+        if (r.left > minLeft && r.width > window.innerWidth * 0.45) chosen = el;
+        el = el.parentElement;
+      }
+      if (chosen) return chosen;
+    }
+  } catch (e) {
+    // fall through
+  }
+
+  // 3. Last resort.
+  return document.querySelector('main') || document.body;
+}
+
+// Returns true when the scope had to be (re)resolved. On a change the text
+// stream is stale and the mutation observer is watching a detached node, so
+// callers must rebuild and re-attach.
 function ensureScope() {
   if (state.scope && document.body.contains(state.scope)) {
-    return state.scope;
+    return false;
   }
   state.scope = findConversationScope();
-  return state.scope;
+  state.dirty = true;
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -470,171 +544,221 @@ function ensureHighlightStyles() {
 
 // ---------------------------------------------------------------------------
 // Stream building
+//
+// The conversation is flattened into a single string with a position map so a
+// query can match text spanning adjacent inline nodes (e.g. markdown emphasis
+// or Angular-split text), while a NUL sentinel at every block boundary
+// prevents matches from ever spanning two messages/paragraphs.
 // ---------------------------------------------------------------------------
 
-function isElement(node) {
-  return node.nodeType === Node.ELEMENT_NODE;
+function escapeRegExp(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function isText(node) {
-  return node.nodeType === Node.TEXT_NODE;
-}
-
-function isNonTextNode(node) {
-  if (isElement(node)) {
-    const tag = node.tagName.toLowerCase();
-    return tag === 'script' || tag === 'style' || tag === 'svg' || tag === 'noscript';
+function acceptTextNode(node) {
+  const el = node.parentElement;
+  if (!el) return false;
+  if (inFindHost(el)) return false;
+  const tag = el.nodeName;
+  if (
+    tag === 'SCRIPT' ||
+    tag === 'STYLE' ||
+    tag === 'NOSCRIPT' ||
+    tag === 'TEMPLATE' ||
+    tag === 'TEXTAREA' ||
+    tag === 'INPUT' ||
+    tag === 'OPTION'
+  ) {
+    return false;
   }
-  return false;
-}
-
-function isHidden(node) {
-  if (!isElement(node)) return false;
-  try {
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) === 0) {
-      return true;
-    }
-  } catch (e) {
-    // ignore
+  if (el.closest && el.closest('svg')) return false;
+  // Never search the message composer (or any other editable draft).
+  const editable = el.closest('[contenteditable]');
+  if (editable && editable.getAttribute('contenteditable') !== 'false') {
+    return false;
   }
-  return node.hasAttribute('hidden') || node.getAttribute('aria-hidden') === 'true';
-}
-
-function shouldIncludeNode(node) {
-  if (isNonTextNode(node)) return false;
-  if (isHidden(node)) return false;
-  if (isText(node)) {
-    return true;
-  }
-  if (isElement(node)) {
-    const style = window.getComputedStyle(node);
-    const disp = style.display;
-    if (disp === 'none') return false;
-    if (!BLOCKISH_DISPLAYS.has(disp)) {
-      // For block elements, their text is included; we just need to traverse children.
-      // Don't skip traversing.
-    }
+  if (el.closest('[aria-hidden="true"]')) return false;
+  if (typeof el.checkVisibility === 'function') {
+    // NOTE: contentVisibilityAuto is deliberately NOT requested. Gemini
+    // virtualizes off-screen conversation turns with content-visibility:auto;
+    // their text is real conversation content and must stay searchable.
+    const hidden = !el.checkVisibility({
+      opacityProperty: true,
+      visibilityProperty: true,
+      checkOpacity: true,
+      checkVisibilityCSS: true,
+    });
+    if (hidden) return false;
   }
   return true;
 }
 
-function isBlockishElement(node) {
-  if (!isElement(node)) return false;
-  try {
-    const style = window.getComputedStyle(node);
-    const disp = style.display;
-    return disp !== 'inline' && disp !== 'contents' && !BLOCKISH_DISPLAYS.has(disp);
-  } catch (e) {
-    return false;
+function makeDisplayGetter(cache) {
+  return (el) => {
+    let d = cache.get(el);
+    if (d === undefined) {
+      try {
+        d = window.getComputedStyle(el).display;
+      } catch (e) {
+        d = 'block';
+      }
+      cache.set(el, d);
+    }
+    return d;
+  };
+}
+
+// True when a block-level box separates prevEl from nextEl in document order.
+function hasBlockBoundary(prevEl, nextEl, root, getDisplay) {
+  const pathFrom = (el) => {
+    const out = [];
+    let cur = el;
+    while (cur) {
+      out.push(cur);
+      if (cur === root) break;
+      cur = cur.parentElement;
+    }
+    return out;
+  };
+  const a = pathFrom(prevEl);
+  const b = pathFrom(nextEl);
+
+  let common = null;
+  let ia = -1;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].contains(nextEl)) {
+      common = a[i];
+      ia = i;
+      break;
+    }
   }
+  if (!common) return true; // unrelated trees -> be safe, separate them
+
+  const ib = b.indexOf(common);
+  if (ib === -1) return true;
+
+  for (let i = 0; i < ia; i++) {
+    if (!BLOCKISH_DISPLAYS.has(getDisplay(a[i]))) return true;
+  }
+  for (let i = 0; i < ib; i++) {
+    if (!BLOCKISH_DISPLAYS.has(getDisplay(b[i]))) return true;
+  }
+  return false;
 }
 
 function buildChunks(scope) {
   const chunks = [];
-  const chunkStarts = [];
+  const starts = [];
+  const displayCache = new Map();
+  const getDisplay = makeDisplayGetter(displayCache);
   let streamLen = 0;
+  let prevParent = null;
 
-  function walk(node) {
-    if (!node) return;
-    if (isNonTextNode(node)) return;
-    if (isHidden(node)) return;
-
-    if (isText(node)) {
-      const text = node.nodeValue;
-      if (text && text.length > 0) {
-        chunkStarts.push(streamLen);
-        chunks.push({ node: node, text: text });
-        streamLen += text.length;
-      }
-      return;
-    }
-
-    if (isElement(node)) {
-      const tag = node.tagName.toLowerCase();
-      if (tag === 'br') {
-        chunkStarts.push(streamLen);
-        chunks.push({ node: null, text: '\n' });
-        streamLen += 1;
-        return;
-      }
-
-      const isBlock = isBlockishElement(node);
-      const childNodes = node.childNodes;
-      for (let i = 0; i < childNodes.length; i++) {
-        walk(childNodes[i]);
-      }
-      if (isBlock && chunks.length > 0) {
-        // Add sentinel at block boundary
-        const last = chunks[chunks.length - 1];
-        if (last.text && last.text[last.text.length - 1] !== SENTINEL) {
-          chunkStarts.push(streamLen);
-          chunks.push({ node: null, text: SENTINEL });
-          streamLen += 1;
-        }
-      }
-      return;
-    }
-
-    const childNodes = node.childNodes;
-    if (childNodes && childNodes.length) {
-      for (let i = 0; i < childNodes.length; i++) {
-        walk(childNodes[i]);
-      }
-    }
+  let walker;
+  try {
+    walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT, {
+      acceptNode: (node) =>
+        node.data && acceptTextNode(node)
+          ? NodeFilter.FILTER_ACCEPT
+          : NodeFilter.FILTER_REJECT,
+    });
+  } catch (e) {
+    state.chunks = [];
+    state.chunkStarts = [];
+    return;
   }
 
-  walk(scope);
+  let node;
+  while ((node = walker.nextNode())) {
+    const parent = node.parentElement;
+    if (prevParent && hasBlockBoundary(prevParent, parent, scope, getDisplay)) {
+      starts.push(streamLen);
+      chunks.push({ node: null, text: SENTINEL });
+      streamLen += SENTINEL.length;
+    }
+    starts.push(streamLen);
+    chunks.push({ node: node, text: node.data });
+    streamLen += node.data.length;
+    prevParent = parent;
+  }
+
   state.chunks = chunks;
-  state.chunkStarts = chunkStarts;
+  state.chunkStarts = starts;
 }
 
 // ---------------------------------------------------------------------------
 // Matching
 // ---------------------------------------------------------------------------
 
+// Map a stream offset to { node, offset } inside the text node that owns it.
+function locate(offset, preferEnd) {
+  const starts = state.chunkStarts;
+  const chunks = state.chunks;
+  if (!chunks.length) return null;
+
+  let lo = 0;
+  let hi = starts.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (starts[mid] <= offset) lo = mid;
+    else hi = mid - 1;
+  }
+
+  // Landed on a sentinel (only possible for an end offset sitting right
+  // before a block boundary): resolve to the adjacent real text node.
+  if (!chunks[lo].node) {
+    if (preferEnd) {
+      while (lo > 0 && !chunks[lo].node) lo--;
+      if (!chunks[lo].node) return null;
+      return { node: chunks[lo].node, offset: chunks[lo].text.length };
+    }
+    while (lo < chunks.length - 1 && !chunks[lo].node) lo++;
+    if (!chunks[lo].node) return null;
+    return { node: chunks[lo].node, offset: 0 };
+  }
+
+  return { node: chunks[lo].node, offset: offset - starts[lo] };
+}
+
+function makeRange(startOffset, endOffset) {
+  const s = locate(startOffset, false);
+  const e = locate(endOffset, true);
+  if (!s || !e) return null;
+  try {
+    const range = document.createRange();
+    range.setStart(s.node, s.offset);
+    range.setEnd(e.node, e.offset);
+    return range;
+  } catch (err) {
+    return null; // nodes detached between mutations
+  }
+}
+
 function computeMatches(query) {
   const matches = [];
-  if (!query || !supportsHighlights()) return matches;
-  if (!state.scope || !state.chunks || state.chunks.length === 0) return matches;
+  if (!query || !state.chunks || state.chunks.length === 0) return matches;
 
-  const flags = state.matchCase ? 'g' : 'gi';
+  const stream = state.chunks.map((c) => c.text).join('');
   let re;
   try {
-    re = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
+    re = new RegExp(
+      escapeRegExp(query),
+      state.matchCase ? 'g' : 'gi'
+    );
   } catch (e) {
     return matches;
   }
 
-  let totalMatches = 0;
-  for (let i = 0; i < state.chunks.length && totalMatches < MAX_MATCHES; i++) {
-    const chunk = state.chunks[i];
-    if (!chunk.node || !chunk.text) continue;
-    const text = chunk.text;
-    re.lastIndex = 0;
-    let m;
-    while ((m = re.exec(text)) !== null) {
-      if (m[0].length === 0) {
-        re.lastIndex++;
-        continue;
-      }
-      const start = m.index;
-      const end = m.index + m[0].length;
-      try {
-        const range = document.createRange();
-        range.setStart(chunk.node, start);
-        range.setEnd(chunk.node, end);
-        matches.push(range);
-        totalMatches++;
-        if (matches.length > MAX_HIGHLIGHT_RANGES) {
-          // Still count total, but we won't highlight beyond limit? keep pushing ranges up to MAX_MATCHES,
-          // but CSS highlights can handle many; cap to be safe
-        }
-      } catch (e) {
-        // skip invalid range
-      }
-      if (re.lastIndex === m.index) re.lastIndex++;
+  let m;
+  while ((m = re.exec(stream)) !== null) {
+    if (m[0].length === 0) {
+      re.lastIndex++;
+      continue;
     }
+    const range = makeRange(m.index, m.index + m[0].length);
+    if (range) matches.push(range);
+    if (matches.length >= MAX_MATCHES) break;
+    if (re.lastIndex === m.index) re.lastIndex++;
   }
 
   // Cap to avoid excessive highlighting
@@ -692,12 +816,34 @@ function findScrollable(el, horizontal) {
   while (node && node !== document.body && node !== document.documentElement) {
     const style = window.getComputedStyle(node);
     const overflow = horizontal ? style.overflowX : style.overflowY;
-    if (overflow === 'auto' || overflow === 'scroll') {
+    // Require real scrollability in this axis: CSS computes overflow-y to
+    // "auto" on any element with overflow-x: auto (e.g. Gemini's code
+    // blocks), which would otherwise be picked as the scroller even though
+    // it can never scroll vertically.
+    const hasOverflow = horizontal
+      ? node.scrollWidth > node.clientWidth + 1
+      : node.scrollHeight > node.clientHeight + 1;
+    if ((overflow === 'auto' || overflow === 'scroll') && hasOverflow) {
       return node;
     }
     node = node.parentElement;
   }
   return null;
+}
+
+function centerOn(rect, startEl, behavior) {
+  const scroller = startEl ? findScrollable(startEl, false) : null;
+  const margin = 80;
+  const smooth = behavior === 'smooth';
+
+  if (scroller) {
+    const sRect = scroller.getBoundingClientRect();
+    const top = scroller.scrollTop + rect.top - sRect.top - margin;
+    scroller.scrollTo({ top: Math.max(0, top), behavior: smooth ? 'smooth' : 'auto' });
+  } else {
+    const top = window.pageYOffset + rect.top - margin;
+    window.scrollTo({ top: Math.max(0, top), behavior: smooth ? 'smooth' : 'auto' });
+  }
 }
 
 function jumpToActive() {
@@ -712,17 +858,98 @@ function jumpToActive() {
   const startEl = range.startContainer.nodeType === Node.ELEMENT_NODE
     ? range.startContainer
     : range.startContainer.parentElement;
-  const scroller = startEl ? findScrollable(startEl, false) : null;
-  const margin = 80;
 
-  if (scroller) {
-    const sRect = scroller.getBoundingClientRect();
-    const top = scroller.scrollTop + rect.top - sRect.top - margin;
-    scroller.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+  // Gemini virtualizes off-screen conversation turns with
+  // content-visibility:auto: matches inside a skipped turn have no boxes, so
+  // their rect is all zeros and there is nothing to center on. Scroll the
+  // turn's container (which keeps a placeholder box) into view first; the
+  // browser then renders its content and the real rect becomes measurable on
+  // the next frames.
+  const zeroRect = !rect || (rect.top === 0 && rect.left === 0 && rect.width === 0 && rect.height === 0);
+  if (zeroRect && startEl) {
+    let container = null;
+    if (startEl.closest) {
+      container =
+        startEl.closest('.conversation-container') ||
+        startEl.closest('model-response') ||
+        startEl.closest('user-query') ||
+        null;
+    }
+    if (!container) {
+      // Fall back to the nearest ancestor that still has a box.
+      let el = startEl;
+      while (el && el !== document.body) {
+        const r = el.getBoundingClientRect();
+        if (r && (r.width > 0 || r.height > 0)) {
+          container = el;
+          break;
+        }
+        el = el.parentElement;
+      }
+    }
+    if (!container) return;
+    try {
+      container.scrollIntoView({ block: 'center', behavior: 'auto' });
+    } catch (e) {
+      return;
+    }
   } else {
-    const top = window.pageYOffset + rect.top - margin;
-    window.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+    // Initial centering is instant: smooth scrolling races with the list
+    // re-layout below and ends up stale (the follow-up passes would fight it).
+    centerOn(rect, startEl, 'auto');
   }
+
+  // Follow-up correction chain. Virtualized lists keep re-laying-out while
+  // skipped turns between the old position and the target unskip and take
+  // their real size, so the initial scroll target goes stale almost
+  // immediately. Re-measure and correct in small instant steps until the
+  // match is centered; the deadline and the jump token bound the work, and
+  // a user scroll or step cancels it via clearJumpIntent()/jumpToActive().
+  const jumpToken = state.jumpToken = (state.jumpToken || 0) + 1;
+  // Generous budget: Gemini's infinite-scroller pins the scroll position
+  // while it lazily loads older history (triggered by scrolling up), so the
+  // chain may have to wait out the pin before it can converge. The chain is
+  // cheap (one rect + one scrollTo per pass) and cancels itself on the next
+  // user scroll, step, close or navigation.
+  const deadline = Date.now() + 20000;
+  const correct = (attempt) => {
+    if (jumpToken !== state.jumpToken) return; // user stepped / scrolled away
+    if (state.activeIdx < 0 || !state.matches[state.activeIdx]) return;
+    const cur = state.matches[state.activeIdx];
+    let r2;
+    try {
+      r2 = cur.getBoundingClientRect();
+    } catch (e) {
+      return;
+    }
+    if (!r2 || (r2.top === 0 && r2.left === 0 && r2.width === 0 && r2.height === 0)) {
+      return; // not rendered (yet) -- the container scroll above should prevent this
+    }
+    const startEl2 =
+      cur.startContainer.nodeType === Node.ELEMENT_NODE
+        ? cur.startContainer
+        : cur.startContainer.parentElement;
+    const scroller = startEl2 ? findScrollable(startEl2, false) : null;
+    const sRect = scroller
+      ? scroller.getBoundingClientRect()
+      : { top: 0, height: window.innerHeight };
+    const delta = r2.top - (sRect.top + sRect.height / 2);
+    if (Math.abs(delta) < 48) return; // centered -- done
+    if (attempt > 0 && Date.now() > deadline) return; // out of budget
+    const target = (scroller ? scroller.scrollTop : window.pageYOffset) + delta;
+    try {
+      if (scroller) scroller.scrollTo({ top: Math.max(0, target), behavior: 'auto' });
+      else window.scrollTo({ top: Math.max(0, target), behavior: 'auto' });
+    } catch (e) {
+      return;
+    }
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => setTimeout(() => correct(attempt + 1), 120));
+    });
+  };
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => setTimeout(() => correct(0), 40));
+  });
 }
 
 function pickNearestIdx() {
@@ -771,6 +998,8 @@ function markJumpIntent() {
 
 function clearJumpIntent() {
   state.pendingJumpUntil = 0;
+  // Abort any in-flight jump correction passes: the user has taken over.
+  state.jumpToken = (state.jumpToken || 0) + 1;
 }
 
 function isMatchInView(range) {
@@ -799,7 +1028,11 @@ function rebuild({ jump = false, fresh = false } = {}) {
   if (!ui) return;
   if (jump) markJumpIntent();
   if (state.dirty || !state.chunks) {
-    ensureScope();
+    const scopeChanged = ensureScope();
+    if (scopeChanged && state.visible) {
+      // The old observer was watching a detached element; re-attach to the new scope.
+      attachMutationObserver();
+    }
     state.dirty = false;
     if (state.scope) {
       buildChunks(state.scope);
@@ -841,9 +1074,16 @@ function updateCounter() {
   const total = state.matches.length;
   const active = state.activeIdx >= 0 ? state.activeIdx + 1 : 0;
   if (total === 0) {
-    ui.counter.textContent = '';
-    ui.counter.classList.add('is-empty');
-    ui.counter.classList.remove('is-none');
+    const hasQuery = ui.input.value.trim().length > 0;
+    if (hasQuery) {
+      ui.counter.textContent = 'No results';
+      ui.counter.classList.remove('is-empty');
+      ui.counter.classList.add('is-none');
+    } else {
+      ui.counter.textContent = '';
+      ui.counter.classList.add('is-empty');
+      ui.counter.classList.remove('is-none');
+    }
     return;
   }
   ui.counter.textContent = active + '/' + total;
