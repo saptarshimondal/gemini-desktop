@@ -1554,6 +1554,25 @@ const ARTIFACT_STYLES = `
   max-height: 100%;
   height: 100%;
 }
+/* Real Fullscreen API: the host joins the browser's TOP LAYER, so no page
+   element (Gemini's header bar, menus, dialogs) can ever paint above it.
+   Layout containment on our ancestors otherwise traps z-index in their
+   stacking context, which is what let the Gemini logo / triple-dot overlap
+   the panel. These rules back up the inline styles set by JS. */
+:host(:fullscreen) {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  display: flex;
+  flex-direction: column;
+  background: rgba(0, 0, 0, 0.75);
+  margin: 0;
+  width: 100vw;
+  height: 100vh;
+}
+:host(:fullscreen)::backdrop {
+  background: #000;
+}
 `;
 
 // Runs FIRST inside the sandboxed child (nonce injected by the composer).
@@ -1959,6 +1978,101 @@ function destroyArtifactEntry(entry) {
   if (entry.frameWindow) artifactFrames.delete(entry.frameWindow);
 }
 
+// --- Fullscreen ---------------------------------------------------------------
+//
+// Gemini's chat scroller (INFINITE-SCROLLER / CHAT-WINDOW) uses
+// container-type: inline-size, which implies layout containment. Layout
+// containment creates a stacking context AND makes the element a containing
+// block for fixed descendants - so any z-index we set inside it is trapped,
+// and Gemini's header (logo, triple-dot menu) painted on top of our overlay.
+// The fix: use the Fullscreen API so the panel joins the browser's TOP
+// LAYER, which no page stacking context can beat. A pure CSS overlay stays
+// as a fallback when the API is unavailable or denied.
+
+function applyArtifactFullscreenState(entry, active) {
+  entry.isFullscreen = active;
+  if (active) {
+    // Save once: this runs from both the requestFullscreen settlement and
+    // the fullscreenchange listener; re-entering must not capture our own
+    // fullscreen cssText as the "original".
+    if (entry.savedHostCssText == null) {
+      entry.savedHostCssText = entry.host.style.cssText;
+      entry.savedFrameHeight = entry.iframe.style.height;
+    }
+    entry.host.classList.add('fullscreen-active');
+    // Inline styles beat the :host(...) stylesheet rules, so the fullscreen
+    // layout must be applied inline too (the original all:initial pins
+    // position:static and would defeat position:fixed). Max z-index helps
+    // the fallback overlay; the top layer is what really wins.
+    entry.host.style.cssText =
+      'all: initial; display: flex; flex-direction: column; box-sizing: border-box;' +
+      ' position: fixed; inset: 0; z-index: 2147483647; width: 100vw; height: 100vh;' +
+      ' margin: 0; background: rgba(0, 0, 0, 0.75);';
+    entry.iframe.style.height = '100%';
+    // replaceChildren only - innerHTML is a TrustedHTML sink and Gemini
+    // enforces require-trusted-types-for 'script'.
+    entry.fullscreenBtn.replaceChildren(iconFullscreenExit());
+    entry.fullscreenBtn.title = 'Exit fullscreen';
+  } else {
+    entry.host.classList.remove('fullscreen-active');
+    if (entry.savedHostCssText != null) {
+      entry.host.style.cssText = entry.savedHostCssText;
+      entry.iframe.style.height = entry.savedFrameHeight || '';
+      entry.savedHostCssText = null;
+      entry.savedFrameHeight = null;
+    }
+    entry.fullscreenBtn.replaceChildren(iconFullscreen());
+    entry.fullscreenBtn.title = 'Enter fullscreen';
+  }
+}
+
+function enterArtifactFullscreen(entry) {
+  entry.isFullscreen = true;
+  let req = null;
+  try {
+    if (entry.host.requestFullscreen) {
+      entry.fsApiRequested = true;
+      req = entry.host.requestFullscreen({ navigationUI: 'hide' });
+    }
+  } catch (e) {
+    req = null;
+  }
+  if (req && typeof req.then === 'function') {
+    req.then(
+      () => {
+        if (entry.isFullscreen) applyArtifactFullscreenState(entry, true);
+      },
+      () => {
+        // API denied/unavailable: drop to the CSS overlay fallback.
+        entry.fsApiRequested = false;
+        if (entry.isFullscreen) applyArtifactFullscreenState(entry, true);
+      }
+    );
+    return;
+  }
+  applyArtifactFullscreenState(entry, true);
+}
+
+function exitArtifactFullscreen(entry) {
+  entry.isFullscreen = false;
+  const unwind = () => applyArtifactFullscreenState(entry, false);
+  if (document.fullscreenElement === entry.host && document.exitFullscreen) {
+    let exit = null;
+    try {
+      exit = document.exitFullscreen();
+    } catch (e) {
+      exit = null;
+    }
+    if (exit && typeof exit.then === 'function') {
+      exit.then(unwind, unwind);
+      return;
+    }
+  }
+  // Fallback overlay (or fullscreen still pending - the listener unwinds
+  // the pending case once the element actually enters the top layer).
+  if (entry.host.classList.contains('fullscreen-active')) unwind();
+}
+
 function createArtifactEntry(response, blocks) {
   const host = document.createElement('div');
   host.setAttribute(ARTIFACT_PANEL_ATTR, '1');
@@ -2042,6 +2156,7 @@ function createArtifactEntry(response, blocks) {
     doc: null,
     hiddenOriginals: new Map(),
     isFullscreen: false,
+    fsApiRequested: false,
   };
 
   // Clicks on our controls must not reach Gemini's document-level handlers.
@@ -2074,31 +2189,10 @@ function createArtifactEntry(response, blocks) {
   });
   fullscreenBtn.addEventListener('click', (e) => {
     e.stopPropagation();
-    entry.isFullscreen = !entry.isFullscreen;
     if (entry.isFullscreen) {
-      // Inline styles beat the :host(...) stylesheet rules, so the
-      // fullscreen layout must be applied inline too (the original
-      // all:initial pins position:static and would defeat position:fixed).
-      entry.savedHostCssText = entry.host.style.cssText;
-      entry.savedFrameHeight = entry.iframe.style.height;
-      entry.host.classList.add('fullscreen-active');
-      entry.host.style.cssText =
-        'all: initial; display: flex; flex-direction: column; box-sizing: border-box;' +
-        ' position: fixed; inset: 0; z-index: 9999; width: 100vw; height: 100vh;' +
-        ' margin: 0; background: rgba(0, 0, 0, 0.75);';
-      entry.iframe.style.height = '100%';
-      // replaceChildren only - innerHTML is a TrustedHTML sink and Gemini
-      // enforces require-trusted-types-for 'script'.
-      fullscreenBtn.replaceChildren(iconFullscreenExit());
-      fullscreenBtn.title = 'Exit fullscreen';
+      exitArtifactFullscreen(entry);
     } else {
-      entry.host.classList.remove('fullscreen-active');
-      entry.host.style.cssText =
-        entry.savedHostCssText ||
-        'all: initial; display: block; width: 100%; box-sizing: border-box; margin: 12px 0;';
-      entry.iframe.style.height = entry.savedFrameHeight || '';
-      fullscreenBtn.replaceChildren(iconFullscreen());
-      fullscreenBtn.title = 'Enter fullscreen';
+      enterArtifactFullscreen(entry);
     }
   });
   seg.appendChild(copyBtn);
@@ -2273,6 +2367,35 @@ function startArtifactObserver() {
   // Build panels for anything already on the page.
   scheduleArtifactPass(ARTIFACT_DEBOUNCE_MS);
 }
+
+// --- Fullscreen sync (Escape exits the top layer natively) --------------------
+
+document.addEventListener(
+  'fullscreenchange',
+  guard(() => {
+    const fsEl = document.fullscreenElement;
+    for (const [, entry] of artifactFrames) {
+      const inFs = fsEl === entry.host;
+      if (inFs) {
+        if (!entry.isFullscreen) {
+          // UI state already says windowed (exit clicked while the enter
+          // request was still pending): unwind so visuals match the button.
+          try {
+            document.exitFullscreen();
+          } catch (e) {
+            // ignore
+          }
+        } else {
+          applyArtifactFullscreenState(entry, true);
+        }
+      } else if (entry.isFullscreen && entry.fsApiRequested) {
+        // Native exit (Escape) while we believed we were fullscreen.
+        entry.fsApiRequested = false;
+        applyArtifactFullscreenState(entry, false);
+      }
+    }
+  })
+);
 
 // --- Height reporting (child -> parent) -------------------------------------
 
