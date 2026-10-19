@@ -1372,6 +1372,41 @@ const ARTIFACT_LANG_HTML = 'html';
 const ARTIFACT_LANG_CSS = 'css';
 const ARTIFACT_LANG_JS = 'js';
 
+// SVG icons for buttons
+function iconFullscreen() {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('width', '14');
+  svg.setAttribute('height', '14');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '2');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  const path = document.createElementNS(ns, 'path');
+  path.setAttribute('d', 'M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3');
+  svg.appendChild(path);
+  return svg;
+}
+
+function iconFullscreenExit() {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('width', '14');
+  svg.setAttribute('height', '14');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '2');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  const path = document.createElementNS(ns, 'path');
+  path.setAttribute('d', 'M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3');
+  svg.appendChild(path);
+  return svg;
+}
+
 const ARTIFACT_STYLES = `
 :host([data-theme='dark']) {
   --bg: #2b2b30;
@@ -1478,6 +1513,46 @@ const ARTIFACT_STYLES = `
 }
 .copy {
   margin-left: 4px;
+}
+.fullscreen {
+  margin-left: 2px;
+}
+:host(.fullscreen-active) {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  background: rgba(0, 0, 0, 0.75);
+  margin: 0;
+  width: 100vw;
+  height: 100vh;
+}
+:host(.fullscreen-active) .bar {
+  border-radius: 0;
+  border-left: 0;
+  border-right: 0;
+  border-top: 0;
+}
+:host(.fullscreen-active) .wrap {
+  flex: 1;
+  border-radius: 0;
+  border-left: 0;
+  border-right: 0;
+  border-bottom: 0;
+  display: flex;
+  flex-direction: column;
+  background: #000;
+}
+:host(.fullscreen-active) .frame {
+  height: 100%;
+  flex: 1;
+  width: 100%;
+}
+:host(.fullscreen-active) .src {
+  flex: 1;
+  max-height: 100%;
+  height: 100%;
 }
 `;
 
@@ -1858,7 +1933,9 @@ function applyArtifactDoc(entry) {
   const policy = getArtifactPolicy();
   if (!policy || !entry.doc) return;
   try {
-    entry.iframe.style.height = ARTIFACT_DEFAULT_HEIGHT + 'px';
+    if (!entry.isFullscreen) {
+      entry.iframe.style.height = ARTIFACT_DEFAULT_HEIGHT + 'px';
+    }
     entry.iframe.srcdoc = policy.createHTML(entry.doc);
   } catch (e) {
     logError(e);
@@ -1940,6 +2017,14 @@ function createArtifactEntry(response, blocks) {
   copyBtn.className = 'btn copy';
   copyBtn.textContent = 'Copy';
   copyBtn.setAttribute('aria-label', 'Copy artifact source');
+  copyBtn.title = 'Copy source';
+
+  const fullscreenBtn = document.createElement('button');
+  fullscreenBtn.type = 'button';
+  fullscreenBtn.className = 'btn fullscreen';
+  fullscreenBtn.title = 'Enter fullscreen';
+  fullscreenBtn.setAttribute('aria-label', 'Toggle fullscreen');
+  fullscreenBtn.appendChild(iconFullscreen());
 
   const entry = {
     host: host,
@@ -1950,11 +2035,13 @@ function createArtifactEntry(response, blocks) {
     renderedBtn: renderedBtn,
     sourceBtn: sourceBtn,
     copyBtn: copyBtn,
+    fullscreenBtn: fullscreenBtn,
     view: 'rendered',
     blocks: blocks,
     contentKey: null,
     doc: null,
     hiddenOriginals: new Map(),
+    isFullscreen: false,
   };
 
   // Clicks on our controls must not reach Gemini's document-level handlers.
@@ -1985,7 +2072,37 @@ function createArtifactEntry(response, blocks) {
       // ignore - clipboard may be unavailable
     }
   });
+  fullscreenBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    entry.isFullscreen = !entry.isFullscreen;
+    if (entry.isFullscreen) {
+      // Inline styles beat the :host(...) stylesheet rules, so the
+      // fullscreen layout must be applied inline too (the original
+      // all:initial pins position:static and would defeat position:fixed).
+      entry.savedHostCssText = entry.host.style.cssText;
+      entry.savedFrameHeight = entry.iframe.style.height;
+      entry.host.classList.add('fullscreen-active');
+      entry.host.style.cssText =
+        'all: initial; display: flex; flex-direction: column; box-sizing: border-box;' +
+        ' position: fixed; inset: 0; z-index: 9999; width: 100vw; height: 100vh;' +
+        ' margin: 0; background: rgba(0, 0, 0, 0.75);';
+      entry.iframe.style.height = '100%';
+      // replaceChildren only - innerHTML is a TrustedHTML sink and Gemini
+      // enforces require-trusted-types-for 'script'.
+      fullscreenBtn.replaceChildren(iconFullscreenExit());
+      fullscreenBtn.title = 'Exit fullscreen';
+    } else {
+      entry.host.classList.remove('fullscreen-active');
+      entry.host.style.cssText =
+        entry.savedHostCssText ||
+        'all: initial; display: block; width: 100%; box-sizing: border-box; margin: 12px 0;';
+      entry.iframe.style.height = entry.savedFrameHeight || '';
+      fullscreenBtn.replaceChildren(iconFullscreen());
+      fullscreenBtn.title = 'Enter fullscreen';
+    }
+  });
   seg.appendChild(copyBtn);
+  seg.appendChild(fullscreenBtn);
 
   // Place the panel right after the wrapper of the last qualifying code
   // block, inside the markdown flow (never re-parent Gemini's nodes).
@@ -2170,6 +2287,11 @@ window.addEventListener(
     const h = Number(data.h);
     if (!isFinite(h) || h <= 0) return;
     const clamped = Math.max(ARTIFACT_MIN_HEIGHT, Math.min(ARTIFACT_MAX_HEIGHT, Math.round(h)));
+    // While fullscreen, the iframe is sized by CSS (100%); don't override.
+    if (entry.isFullscreen) {
+      entry.lastReportedHeight = clamped;
+      return;
+    }
     entry.iframe.style.height = clamped + 'px';
   })
 );
