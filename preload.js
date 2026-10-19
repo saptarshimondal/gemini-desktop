@@ -1366,7 +1366,12 @@ const ARTIFACT_DEBOUNCE_MS = 400;
 const ARTIFACT_SETTLE_MS = 1000;
 const ARTIFACT_DEFAULT_HEIGHT = 420;
 const ARTIFACT_MIN_HEIGHT = 160;
-const ARTIFACT_MAX_HEIGHT = 2400;
+const ARTIFACT_MAX_HEIGHT = 2400; // absolute backstop for very large screens
+// A preview never grows past this fraction of the window: taller content
+// scrolls INSIDE the iframe instead of shoving the conversation away.
+// (The child reports its full scrollHeight; this is what keeps tall
+// artifacts like long interactive tools from becoming 2-3 viewports.)
+const ARTIFACT_MAX_VIEWPORT_FRACTION = 0.75;
 
 const ARTIFACT_LANG_HTML = 'html';
 const ARTIFACT_LANG_CSS = 'css';
@@ -1417,6 +1422,15 @@ const ARTIFACT_STYLES = `
   --checked: rgba(255, 255, 255, 0.18);
   --focus: #6aa5ff;
   --code-bg: #1e1f22;
+  /* Syntax tokens (GitHub-dark palette on --code-bg) */
+  --tok-kw: #ff7b72;
+  --tok-str: #a5d6ff;
+  --tok-com: #8b949e;
+  --tok-num: #79c0ff;
+  --tok-fn: #d2a8ff;
+  --tok-typ: #ffa657;
+  --tok-tag: #7ee787;
+  --tok-attr: #79c0ff;
   color-scheme: dark;
 }
 :host([data-theme='light']) {
@@ -1428,6 +1442,15 @@ const ARTIFACT_STYLES = `
   --checked: rgba(0, 0, 0, 0.12);
   --focus: #1a73e8;
   --code-bg: #f8f9fa;
+  /* Syntax tokens (GitHub-light palette on --code-bg) */
+  --tok-kw: #cf222e;
+  --tok-str: #0a3069;
+  --tok-com: #6e7781;
+  --tok-num: #0550ae;
+  --tok-fn: #8250df;
+  --tok-typ: #953800;
+  --tok-tag: #116329;
+  --tok-attr: #0550ae;
   color-scheme: light;
 }
 :host {
@@ -1510,6 +1533,70 @@ const ARTIFACT_STYLES = `
   font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   white-space: pre;
   tab-size: 2;
+}
+.src code {
+  font: inherit;
+  color: inherit;
+}
+/* Syntax highlighting: highlight.js token classes (v11), themed via the
+   panel's light/dark variables so they follow Gemini's theme. */
+.src .hljs-keyword,
+.src .hljs-selector-tag,
+.src .hljs-literal,
+.src .hljs-doctag {
+  color: var(--tok-kw);
+}
+.src .hljs-string,
+.src .hljs-regexp,
+.src .hljs-char.escape_ {
+  color: var(--tok-str);
+}
+.src .hljs-comment,
+.src .hljs-quote,
+.src .hljs-meta {
+  color: var(--tok-com);
+}
+.src .hljs-comment,
+.src .hljs-quote {
+  font-style: italic;
+}
+.src .hljs-number,
+.src .hljs-symbol,
+.src .hljs-bullet {
+  color: var(--tok-num);
+}
+.src .hljs-title,
+.src .hljs-section {
+  color: var(--tok-fn);
+}
+.src .hljs-type,
+.src .hljs-built_in,
+.src .hljs-selector-pseudo {
+  color: var(--tok-typ);
+}
+.src .hljs-name {
+  color: var(--tok-tag);
+}
+.src .hljs-tag {
+  color: var(--tok-com);
+}
+.src .hljs-attr,
+.src .hljs-attribute,
+.src .hljs-property,
+.src .hljs-selector-id,
+.src .hljs-selector-class,
+.src .hljs-selector-attr,
+.src .hljs-variable,
+.src .hljs-variable.language_,
+.src .hljs-variable.parameter_,
+.src .hljs-params {
+  color: var(--tok-attr);
+}
+.src .hljs-emphasis {
+  font-style: italic;
+}
+.src .hljs-strong {
+  font-weight: 700;
 }
 .copy {
   margin-left: 4px;
@@ -1934,6 +2021,96 @@ function hideArtifactBlocks(entry) {
   }
 }
 
+// --- Source view highlighting -------------------------------------------------
+//
+// highlight.js is used ONLY as a pure string->string function
+// (hljs.highlight()), which touches no DOM and is therefore safe under
+// Gemini's Trusted Types enforcement. Its escaped HTML output travels
+// through the same TrustedTypePolicy + DOMParser path as
+// composeArtifactDocument (parseFromString is a TrustedHTML sink); spans
+// are then imported as nodes - no innerHTML anywhere. The library is
+// loaded lazily; if it can't load, Source view degrades to plain text.
+
+let artifactHljs = null;
+let artifactHljsTried = false;
+
+function getArtifactHljs() {
+  if (!artifactHljsTried) {
+    artifactHljsTried = true;
+    try {
+      artifactHljs = require('highlight.js/lib/common');
+    } catch (e) {
+      artifactHljs = null;
+      logError(e);
+    }
+  }
+  return artifactHljs;
+}
+
+// Our extracted block languages -> highlight.js grammar names.
+const ARTIFACT_HLJS_LANG = {
+  html: 'xml', // the xml grammar covers html/svg/mathml
+  css: 'css',
+  js: 'javascript',
+};
+
+function artifactHighlightFragment(lang, text) {
+  const frag = document.createDocumentFragment();
+  const plain = () => {
+    frag.appendChild(document.createTextNode(text));
+    return frag;
+  };
+
+  const hljs = getArtifactHljs();
+  const policy = getArtifactPolicy();
+  if (!hljs || !policy) return plain();
+
+  const name = ARTIFACT_HLJS_LANG[lang] || lang;
+  let html;
+  try {
+    if (!hljs.getLanguage(name)) return plain();
+    html = hljs.highlight(text, { language: name, ignoreIllegals: true }).value;
+  } catch (e) {
+    logError(e);
+    return plain();
+  }
+
+  try {
+    const parsed = new DOMParser().parseFromString(
+      policy.createHTML(html),
+      'text/html'
+    );
+    const body = parsed.body;
+    // adoptNode MOVES the node. importNode only COPIES it, which would
+    // leave body.firstChild unchanged and spin this loop forever (that
+    // froze the renderer once - do not "simplify" back to it). The bound
+    // is pure defense: exceeding it degrades to plain text, never hangs.
+    let n = 0;
+    while (body.firstChild && n++ < 200000) {
+      frag.appendChild(document.adoptNode(body.firstChild));
+    }
+    if (body.firstChild) throw new Error('artifact highlight import did not drain');
+  } catch (e) {
+    logError(e);
+    frag.textContent = '';
+    frag.appendChild(document.createTextNode(text));
+  }
+  return frag;
+}
+
+function setArtifactSourceText(entry) {
+  // Highlighted per block (each block carries its own language); the '\n\n'
+  // separators keep textContent byte-identical to the old plain join, so
+  // the Copy button still yields raw code.
+  const code = entry.sourceCode;
+  code.replaceChildren();
+  const blocks = entry.blocks;
+  for (let i = 0; i < blocks.length; i++) {
+    if (i > 0) code.appendChild(document.createTextNode('\n\n'));
+    code.appendChild(artifactHighlightFragment(blocks[i].lang, blocks[i].src));
+  }
+}
+
 function applyArtifactView(entry, view) {
   entry.view = view;
   entry.host.setAttribute('data-view', view);
@@ -2017,7 +2194,11 @@ function applyArtifactFullscreenState(entry, active) {
     entry.host.classList.remove('fullscreen-active');
     if (entry.savedHostCssText != null) {
       entry.host.style.cssText = entry.savedHostCssText;
-      entry.iframe.style.height = entry.savedFrameHeight || '';
+      // Re-clamp against the current cap (the window may have been
+      // resized while fullscreen); fall back to the saved px height.
+      entry.iframe.style.height = entry.reportedHeight
+        ? artifactClampHeight(entry.reportedHeight) + 'px'
+        : entry.savedFrameHeight || '';
       entry.savedHostCssText = null;
       entry.savedFrameHeight = null;
     }
@@ -2157,6 +2338,7 @@ function createArtifactEntry(response, blocks) {
     hiddenOriginals: new Map(),
     isFullscreen: false,
     fsApiRequested: false,
+    reportedHeight: 0,
   };
 
   // Clicks on our controls must not reach Gemini's document-level handlers.
@@ -2277,8 +2459,8 @@ function processArtifactResponse(response) {
       target.doc = doc;
       applyArtifactDoc(target);
     }
-    // Keep the Source view in sync with the blocks.
-    target.sourceCode.textContent = blocks.map((b) => b.src).join('\n\n');
+    // Keep the Source view in sync with the blocks (syntax-highlighted).
+    setArtifactSourceText(target);
   }
   applyArtifactView(target, target.view);
 }
@@ -2399,6 +2581,23 @@ document.addEventListener(
 
 // --- Height reporting (child -> parent) -------------------------------------
 
+function artifactMaxHeight() {
+  return Math.max(
+    ARTIFACT_MIN_HEIGHT,
+    Math.min(
+      ARTIFACT_MAX_HEIGHT,
+      Math.floor(window.innerHeight * ARTIFACT_MAX_VIEWPORT_FRACTION)
+    )
+  );
+}
+
+function artifactClampHeight(h) {
+  return Math.max(
+    ARTIFACT_MIN_HEIGHT,
+    Math.min(artifactMaxHeight(), Math.round(h))
+  );
+}
+
 window.addEventListener(
   'message',
   guard((ev) => {
@@ -2409,13 +2608,23 @@ window.addEventListener(
     if (!entry || !entry.iframe || !entry.iframe.isConnected) return;
     const h = Number(data.h);
     if (!isFinite(h) || h <= 0) return;
-    const clamped = Math.max(ARTIFACT_MIN_HEIGHT, Math.min(ARTIFACT_MAX_HEIGHT, Math.round(h)));
+    // Raw child value kept so window resizes can re-clamp against the
+    // viewport-relative cap without waiting for a new report.
+    entry.reportedHeight = h;
     // While fullscreen, the iframe is sized by CSS (100%); don't override.
-    if (entry.isFullscreen) {
-      entry.lastReportedHeight = clamped;
-      return;
+    if (entry.isFullscreen) return;
+    entry.iframe.style.height = artifactClampHeight(h) + 'px';
+  })
+);
+
+window.addEventListener(
+  'resize',
+  guard(() => {
+    for (const [, entry] of artifactFrames) {
+      if (entry.isFullscreen || !entry.reportedHeight) continue;
+      entry.iframe.style.height =
+        artifactClampHeight(entry.reportedHeight) + 'px';
     }
-    entry.iframe.style.height = clamped + 'px';
   })
 );
 
