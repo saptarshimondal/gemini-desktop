@@ -1381,6 +1381,7 @@ const ARTIFACT_STYLES = `
   --hover: rgba(255, 255, 255, 0.1);
   --checked: rgba(255, 255, 255, 0.18);
   --focus: #6aa5ff;
+  --code-bg: #1e1f22;
   color-scheme: dark;
 }
 :host([data-theme='light']) {
@@ -1391,6 +1392,7 @@ const ARTIFACT_STYLES = `
   --hover: rgba(0, 0, 0, 0.07);
   --checked: rgba(0, 0, 0, 0.12);
   --focus: #1a73e8;
+  --code-bg: #f8f9fa;
   color-scheme: light;
 }
 :host {
@@ -1407,13 +1409,8 @@ const ARTIFACT_STYLES = `
   background: var(--bg);
   color: var(--fg);
   border: 1px solid var(--border);
-  border-radius: 10px;
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
-  user-select: none;
-}
-:host([data-view='rendered']) .bar {
   border-radius: 10px 10px 0 0;
-  box-shadow: none;
+  user-select: none;
 }
 .label {
   font-weight: 600;
@@ -1457,15 +1454,30 @@ const ARTIFACT_STYLES = `
   overflow: hidden;
   background: #ffffff;
 }
-.wrap[hidden] {
-  display: none;
-}
 .frame {
   display: block;
   width: 100%;
   height: ${ARTIFACT_DEFAULT_HEIGHT}px;
   border: 0;
   background: #ffffff;
+}
+.src {
+  box-sizing: border-box;
+  display: block;
+  width: 100%;
+  min-height: 200px;
+  max-height: 70vh;
+  overflow: auto;
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--code-bg);
+  color: var(--fg);
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre;
+  tab-size: 2;
+}
+.copy {
+  margin-left: 4px;
 }
 `;
 
@@ -1816,6 +1828,18 @@ function artifactButton(text, view) {
   return btn;
 }
 
+function hideArtifactBlocks(entry) {
+  // Qualifying code blocks stay hidden for as long as the panel exists.
+  // Source view renders the code inside our own panel (a <pre>), so we
+  // never re-show Gemini's block: its re-render is thousands of pixels
+  // tall and used to shove the toggle bar off-screen.
+  for (const b of entry.blocks) {
+    if (!b.el || !b.el.isConnected || entry.hiddenOriginals.has(b.el)) continue;
+    entry.hiddenOriginals.set(b.el, b.el.style.display);
+    b.el.style.display = 'none';
+  }
+}
+
 function applyArtifactView(entry, view) {
   entry.view = view;
   entry.host.setAttribute('data-view', view);
@@ -1824,30 +1848,10 @@ function applyArtifactView(entry, view) {
   entry.renderedBtn.classList.toggle('is-on', view === 'rendered');
   entry.sourceBtn.classList.toggle('is-on', view === 'source');
 
+  // Only the panel's contents swap; the panel itself never moves.
   const showFrame = view === 'rendered';
-  entry.wrap.hidden = !showFrame;
-
-  for (const b of entry.blocks) {
-    if (!b.el || !b.el.isConnected) continue;
-    if (showFrame) {
-      if (!entry.hiddenOriginals.has(b.el)) {
-        entry.hiddenOriginals.set(b.el, b.el.style.display);
-        b.el.style.display = 'none';
-      }
-    } else if (entry.hiddenOriginals.has(b.el)) {
-      b.el.style.display = entry.hiddenOriginals.get(b.el);
-      entry.hiddenOriginals.delete(b.el);
-    }
-  }
-
-  // Restore any block that left the DOM while hidden (it may come back
-  // through virtualized scrolling / re-render).
-  for (const el of Array.from(entry.hiddenOriginals.keys())) {
-    if (el.isConnected && !entry.blocks.some((b) => b.el === el)) {
-      el.style.display = entry.hiddenOriginals.get(el);
-      entry.hiddenOriginals.delete(el);
-    }
-  }
+  entry.iframe.style.display = showFrame ? '' : 'none';
+  entry.sourcePre.style.display = showFrame ? 'none' : '';
 }
 
 function applyArtifactDoc(entry) {
@@ -1919,14 +1923,33 @@ function createArtifactEntry(response, blocks) {
   iframe.setAttribute('sandbox', 'allow-scripts');
   iframe.setAttribute('title', 'Rendered artifact');
   wrap.appendChild(iframe);
+
+  // Source view: the code lives here (inside our panel) instead of
+  // re-showing Gemini's code block - see hideArtifactBlocks().
+  const sourcePre = document.createElement('pre');
+  sourcePre.className = 'src';
+  sourcePre.style.display = 'none';
+  sourcePre.setAttribute('aria-label', 'Artifact source code');
+  const sourceCode = document.createElement('code');
+  sourcePre.appendChild(sourceCode);
+  wrap.appendChild(sourcePre);
   shadow.appendChild(wrap);
+
+  const copyBtn = document.createElement('button');
+  copyBtn.type = 'button';
+  copyBtn.className = 'btn copy';
+  copyBtn.textContent = 'Copy';
+  copyBtn.setAttribute('aria-label', 'Copy artifact source');
 
   const entry = {
     host: host,
     wrap: wrap,
     iframe: iframe,
+    sourcePre: sourcePre,
+    sourceCode: sourceCode,
     renderedBtn: renderedBtn,
     sourceBtn: sourceBtn,
+    copyBtn: copyBtn,
     view: 'rendered',
     blocks: blocks,
     contentKey: null,
@@ -1945,6 +1968,24 @@ function createArtifactEntry(response, blocks) {
     e.stopPropagation();
     applyArtifactView(entry, 'source');
   });
+  copyBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const text = sourceCode.textContent || '';
+    const done = () => {
+      copyBtn.textContent = 'Copied';
+      setTimeout(() => {
+        copyBtn.textContent = 'Copy';
+      }, 1200);
+    };
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, () => {});
+      }
+    } catch (err) {
+      // ignore - clipboard may be unavailable
+    }
+  });
+  seg.appendChild(copyBtn);
 
   // Place the panel right after the wrapper of the last qualifying code
   // block, inside the markdown flow (never re-parent Gemini's nodes).
@@ -1957,6 +1998,7 @@ function createArtifactEntry(response, blocks) {
 
   entry.frameWindow = iframe.contentWindow;
   artifactFrames.set(entry.frameWindow, entry);
+  hideArtifactBlocks(entry);
   applyArtifactView(entry, 'rendered');
   return entry;
 }
@@ -2015,12 +2057,17 @@ function processArtifactResponse(response) {
   target.blocks = blocks;
   target.contentKey = contentKey;
 
+  // Gemini may replace code-block nodes on re-render; hide any new ones.
+  hideArtifactBlocks(target);
+
   if (docChanged) {
     const doc = composeArtifactDocument(blocks, getArtifactNonce());
     if (doc) {
       target.doc = doc;
       applyArtifactDoc(target);
     }
+    // Keep the Source view in sync with the blocks.
+    target.sourceCode.textContent = blocks.map((b) => b.src).join('\n\n');
   }
   applyArtifactView(target, target.view);
 }
