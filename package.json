@@ -1,7 +1,7 @@
 {
   "name": "gemini-desktop",
   "title": "Gemini Desktop",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "desktopName": "gemini-desktop",
   "description": "Unofficial Web app for Google Gemini providing the desktop user experience you would expect on Ubuntu or any other Linux desktop.",
   "main": "index.js",
