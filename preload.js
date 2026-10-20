@@ -1325,3 +1325,1377 @@ window.addEventListener('keydown', (e) => {
     toggle();
   }
 }, true);
+
+// ---------------------------------------------------------------------------
+// Artifact preview (rendered HTML/CSS/JS for code blocks in a response)
+//
+// When a model response contains HTML, CSS and/or JavaScript code blocks,
+// the blocks are combined into a single document and rendered inside a
+// sandboxed iframe, with a "Rendered | Source" toggle injected next to it.
+//
+// Security properties (all verified live against gemini.google.com):
+//
+//  * The page enforces Trusted Types via CSP (`require-trusted-types-for
+//    'script'`): raw `iframe.srcdoc = ...` AND setAttribute('srcdoc') throw.
+//    The document is therefore assigned through a TrustedTypePolicy we
+//    create (policy names are unrestricted - there is no `trusted-types`
+//    directive in Gemini's CSP).
+//  * The iframe uses `sandbox="allow-scripts"` only: no allow-same-origin,
+//    no allow-top-navigation. Verified: child `parent.document` /
+//    `top.document` / `top.location` all throw SecurityError and the child
+//    has an opaque ("null") origin.
+//  * srcdoc documents INHERIT Gemini's full CSP (nonce + strict-dynamic),
+//    so child scripts only run with the page's live nonce (`script.nonce`
+//    IDL property, which stays readable while the content attribute is
+//    concealed) - it is injected into every <script> of the composed doc.
+//  * A bootstrap script (also nonce'd) runs first inside the child and
+//    creates a `default` TrustedTypes policy, which unblocks the artifact's
+//    own innerHTML / eval / new Function usage, re-wires inline event
+//    handler attributes that the inherited CSP blocks, and reports content
+//    height to the parent via postMessage (the parent validates
+//    event.source === iframe.contentWindow before resizing).
+//  * Gemini's own DOM is never re-parented: we only append our own host
+//    element and toggle inline `display` on code blocks (saved/restored).
+// ---------------------------------------------------------------------------
+
+const ARTIFACT_PANEL_ATTR = 'data-gd-artifact-root';
+const ARTIFACT_POLICY_NAME = 'gemini-desktop-artifact';
+const ARTIFACT_DEBOUNCE_MS = 400;
+// Wait for mutations to settle before (re)building the rendered document so
+// a streaming response does not re-execute scripts on every chunk.
+const ARTIFACT_SETTLE_MS = 1000;
+const ARTIFACT_DEFAULT_HEIGHT = 420;
+const ARTIFACT_MIN_HEIGHT = 160;
+const ARTIFACT_MAX_HEIGHT = 2400; // absolute backstop for very large screens
+// A preview never grows past this fraction of the window: taller content
+// scrolls INSIDE the iframe instead of shoving the conversation away.
+// (The child reports its full scrollHeight; this is what keeps tall
+// artifacts like long interactive tools from becoming 2-3 viewports.)
+const ARTIFACT_MAX_VIEWPORT_FRACTION = 0.75;
+
+const ARTIFACT_LANG_HTML = 'html';
+const ARTIFACT_LANG_CSS = 'css';
+const ARTIFACT_LANG_JS = 'js';
+
+// SVG icons for buttons
+function iconFullscreen() {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('width', '14');
+  svg.setAttribute('height', '14');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '2');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  const path = document.createElementNS(ns, 'path');
+  path.setAttribute('d', 'M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3');
+  svg.appendChild(path);
+  return svg;
+}
+
+function iconFullscreenExit() {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('width', '14');
+  svg.setAttribute('height', '14');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '2');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  const path = document.createElementNS(ns, 'path');
+  path.setAttribute('d', 'M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3');
+  svg.appendChild(path);
+  return svg;
+}
+
+const ARTIFACT_STYLES = `
+:host([data-theme='dark']) {
+  --bg: #2b2b30;
+  --fg: #e8e8ec;
+  --muted: #97979f;
+  --border: rgba(255, 255, 255, 0.16);
+  --hover: rgba(255, 255, 255, 0.1);
+  --checked: rgba(255, 255, 255, 0.18);
+  --focus: #6aa5ff;
+  --code-bg: #1e1f22;
+  /* Syntax tokens (GitHub-dark palette on --code-bg) */
+  --tok-kw: #ff7b72;
+  --tok-str: #a5d6ff;
+  --tok-com: #8b949e;
+  --tok-num: #79c0ff;
+  --tok-fn: #d2a8ff;
+  --tok-typ: #ffa657;
+  --tok-tag: #7ee787;
+  --tok-attr: #79c0ff;
+  color-scheme: dark;
+}
+:host([data-theme='light']) {
+  --bg: #ffffff;
+  --fg: #1b1b1f;
+  --muted: #6f6f78;
+  --border: rgba(0, 0, 0, 0.16);
+  --hover: rgba(0, 0, 0, 0.07);
+  --checked: rgba(0, 0, 0, 0.12);
+  --focus: #1a73e8;
+  --code-bg: #f8f9fa;
+  /* Syntax tokens (GitHub-light palette on --code-bg) */
+  --tok-kw: #cf222e;
+  --tok-str: #0a3069;
+  --tok-com: #6e7781;
+  --tok-num: #0550ae;
+  --tok-fn: #8250df;
+  --tok-typ: #953800;
+  --tok-tag: #116329;
+  --tok-attr: #0550ae;
+  color-scheme: light;
+}
+:host {
+  color-scheme: light dark;
+  font: 13px/1.4 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+.bar {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 4px 6px 4px 10px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 10px 10px 0 0;
+  user-select: none;
+}
+.label {
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: 0.2px;
+}
+.seg {
+  display: inline-flex;
+  gap: 2px;
+  margin-left: auto;
+}
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 24px;
+  padding: 2px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.btn:hover {
+  background: var(--hover);
+}
+.btn:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+.btn.is-on {
+  background: var(--checked);
+}
+.wrap {
+  border: 1px solid var(--border);
+  border-top: 0;
+  border-radius: 0 0 10px 10px;
+  overflow: hidden;
+  background: #ffffff;
+}
+.frame {
+  display: block;
+  width: 100%;
+  height: ${ARTIFACT_DEFAULT_HEIGHT}px;
+  border: 0;
+  background: #ffffff;
+}
+.src {
+  box-sizing: border-box;
+  display: block;
+  width: 100%;
+  min-height: 200px;
+  max-height: 70vh;
+  overflow: auto;
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--code-bg);
+  color: var(--fg);
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre;
+  tab-size: 2;
+}
+.src code {
+  font: inherit;
+  color: inherit;
+}
+/* Syntax highlighting: highlight.js token classes (v11), themed via the
+   panel's light/dark variables so they follow Gemini's theme. */
+.src .hljs-keyword,
+.src .hljs-selector-tag,
+.src .hljs-literal,
+.src .hljs-doctag {
+  color: var(--tok-kw);
+}
+.src .hljs-string,
+.src .hljs-regexp,
+.src .hljs-char.escape_ {
+  color: var(--tok-str);
+}
+.src .hljs-comment,
+.src .hljs-quote,
+.src .hljs-meta {
+  color: var(--tok-com);
+}
+.src .hljs-comment,
+.src .hljs-quote {
+  font-style: italic;
+}
+.src .hljs-number,
+.src .hljs-symbol,
+.src .hljs-bullet {
+  color: var(--tok-num);
+}
+.src .hljs-title,
+.src .hljs-section {
+  color: var(--tok-fn);
+}
+.src .hljs-type,
+.src .hljs-built_in,
+.src .hljs-selector-pseudo {
+  color: var(--tok-typ);
+}
+.src .hljs-name {
+  color: var(--tok-tag);
+}
+.src .hljs-tag {
+  color: var(--tok-com);
+}
+.src .hljs-attr,
+.src .hljs-attribute,
+.src .hljs-property,
+.src .hljs-selector-id,
+.src .hljs-selector-class,
+.src .hljs-selector-attr,
+.src .hljs-variable,
+.src .hljs-variable.language_,
+.src .hljs-variable.parameter_,
+.src .hljs-params {
+  color: var(--tok-attr);
+}
+.src .hljs-emphasis {
+  font-style: italic;
+}
+.src .hljs-strong {
+  font-weight: 700;
+}
+.copy {
+  margin-left: 4px;
+}
+.fullscreen {
+  margin-left: 2px;
+}
+:host(.fullscreen-active) {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  background: rgba(0, 0, 0, 0.75);
+  margin: 0;
+  width: 100vw;
+  height: 100vh;
+}
+:host(.fullscreen-active) .bar {
+  border-radius: 0;
+  border-left: 0;
+  border-right: 0;
+  border-top: 0;
+}
+:host(.fullscreen-active) .wrap {
+  flex: 1;
+  border-radius: 0;
+  border-left: 0;
+  border-right: 0;
+  border-bottom: 0;
+  display: flex;
+  flex-direction: column;
+  background: #000;
+}
+:host(.fullscreen-active) .frame {
+  height: 100%;
+  flex: 1;
+  width: 100%;
+}
+:host(.fullscreen-active) .src {
+  flex: 1;
+  max-height: 100%;
+  height: 100%;
+}
+/* Real Fullscreen API: the host joins the browser's TOP LAYER, so no page
+   element (Gemini's header bar, menus, dialogs) can ever paint above it.
+   Layout containment on our ancestors otherwise traps z-index in their
+   stacking context, which is what let the Gemini logo / triple-dot overlap
+   the panel. These rules back up the inline styles set by JS. */
+:host(:fullscreen) {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  display: flex;
+  flex-direction: column;
+  background: rgba(0, 0, 0, 0.75);
+  margin: 0;
+  width: 100vw;
+  height: 100vh;
+}
+:host(:fullscreen)::backdrop {
+  background: #000;
+}
+`;
+
+// Runs FIRST inside the sandboxed child (nonce injected by the composer).
+const ARTIFACT_BOOTSTRAP_JS = `(function () {
+  'use strict';
+
+  // 1) The inherited CSP enforces Trusted Types inside this document. A
+  // default policy unblocks the artifact's own string-to-DOM and
+  // string-to-code usage (innerHTML, insertAdjacentHTML, eval,
+  // new Function, script text assignment).
+  try {
+    if (typeof trustedTypes !== 'undefined' && !trustedTypes.defaultPolicy) {
+      trustedTypes.createPolicy('default', {
+        createHTML: function (s) { return s; },
+        createScript: function (s) { return s; },
+        createScriptURL: function (s) { return s; }
+      });
+    }
+  } catch (e) {}
+
+  // 2) Inline event-handler attributes (onclick=...) are compiled as inline
+  // script, which the inherited CSP blocks. Re-wire them through
+  // addEventListener + Function (allowed here), preserving \`this\` and
+  // return-false semantics.
+  function wire(el) {
+    if (!el || el.nodeType !== 1 || typeof el.getAttributeNames !== 'function') return;
+    var names = el.getAttributeNames();
+    for (var i = 0; i < names.length; i++) {
+      var name = names[i];
+      if (name.length < 3 || name.charAt(0) !== 'o' || name.charAt(1) !== 'n') continue;
+      if (!(name in el)) continue;
+      var code = el.getAttribute(name);
+      if (!code) continue;
+      var type = name.slice(2).toLowerCase();
+      var fn;
+      try { fn = new Function('event', code); } catch (e) { continue; }
+      try { el.removeAttribute(name); } catch (e) {}
+      (function (fn, type) {
+        el.addEventListener(type, function (ev) {
+          var r = fn.call(el, ev);
+          if (r === false && ev && ev.cancelable) ev.preventDefault();
+        });
+      })(fn, type);
+    }
+  }
+
+  function walk(root) {
+    if (!root) return;
+    if (root.nodeType === 1) wire(root);
+    if (root.querySelectorAll) {
+      var all = root.querySelectorAll('*');
+      for (var i = 0; i < all.length; i++) wire(all[i]);
+    }
+  }
+
+  // 3) Height reporting for parent auto-resize. The parent only trusts
+  // messages whose event.source is the iframe it created.
+  var lastH = 0;
+  function reportHeight() {
+    try {
+      var de = document.documentElement;
+      var bd = document.body;
+      var h = Math.max(de ? de.scrollHeight : 0, bd ? bd.scrollHeight : 0);
+      if (h > 0 && h !== lastH) {
+        lastH = h;
+        parent.postMessage({ gdArtifact: 'height', h: h }, '*');
+      }
+    } catch (e) {}
+  }
+
+  // Start observing immediately: artifact scripts run before
+  // DOMContentLoaded, and handlers they register via setAttribute must be
+  // caught as they appear.
+  try {
+    if (typeof MutationObserver !== 'undefined' && document.documentElement) {
+      new MutationObserver(function (records) {
+        for (var i = 0; i < records.length; i++) {
+          var r = records[i];
+          if (r.type === 'attributes') {
+            if (r.attributeName && r.attributeName.slice(0, 2) === 'on') wire(r.target);
+            continue;
+          }
+          var added = r.addedNodes;
+          for (var j = 0; j < added.length; j++) {
+            if (added[j].nodeType === 1) walk(added[j]);
+          }
+        }
+      }).observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+    }
+  } catch (e) {}
+
+  function start() {
+    walk(document);
+    reportHeight();
+    try {
+      if (typeof ResizeObserver !== 'undefined') {
+        var ro = new ResizeObserver(function () { reportHeight(); });
+        ro.observe(document.documentElement);
+        if (document.body) ro.observe(document.body);
+      }
+    } catch (e) {}
+    [60, 300, 1000, 2500].forEach(function (t) { setTimeout(reportHeight, t); });
+    window.addEventListener('load', reportHeight);
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start);
+  } else {
+    start();
+  }
+})();`;
+
+// --- Artifact state ---------------------------------------------------------
+
+// model-response element -> { host, wrap, iframe, renderedBtn, sourceBtn,
+//                             view, blocks, contentKey, doc, hiddenOriginals }
+const artifactPanels = new WeakMap();
+// iframe contentWindow -> entry (for validating height postMessages)
+const artifactFrames = new Map();
+let artifactPolicy = null;
+let artifactNonce = '';
+let artifactObserver = null;
+let artifactTimer = null;
+let artifactLastMutationAt = 0;
+
+// --- Trusted Types / nonce helpers ------------------------------------------
+
+function getArtifactPolicy() {
+  if (artifactPolicy) return artifactPolicy;
+  const factories = { createHTML: (s) => s };
+  try {
+    artifactPolicy = trustedTypes.createPolicy(ARTIFACT_POLICY_NAME, factories);
+    return artifactPolicy;
+  } catch (e) {
+    // Name already taken in this realm (should not happen once per document,
+    // but never let the feature die over it).
+    try {
+      artifactPolicy = trustedTypes.createPolicy(
+        ARTIFACT_POLICY_NAME + '-' + Date.now().toString(36),
+        factories
+      );
+      return artifactPolicy;
+    } catch (e2) {
+      logError(e2);
+      return null;
+    }
+  }
+}
+
+// The nonce content attribute is concealed (empty) on the live page, but the
+// IDL property still exposes it. Only cache a found value - early in loading
+// no scripts may exist yet.
+function getArtifactNonce() {
+  if (artifactNonce) return artifactNonce;
+  try {
+    const scripts = document.scripts;
+    for (let i = 0; i < scripts.length; i++) {
+      const n = scripts[i].nonce;
+      if (n) {
+        artifactNonce = n;
+        return n;
+      }
+    }
+  } catch (e) {
+    logError(e);
+  }
+  return '';
+}
+
+// --- Extraction -------------------------------------------------------------
+
+function classifyArtifactLanguage(block) {
+  try {
+    const span = block.querySelector('.code-block-decoration > span');
+    if (!span) return null;
+    const label = (span.textContent || '').trim().toLowerCase();
+    if (label === 'html') return ARTIFACT_LANG_HTML;
+    if (label === 'css') return ARTIFACT_LANG_CSS;
+    if (label === 'js' || label === 'javascript' || label === 'mjs') return ARTIFACT_LANG_JS;
+  } catch (e) {
+    logError(e);
+  }
+  return null;
+}
+
+function extractArtifactSource(block) {
+  const code =
+    block.querySelector('code.code-container') ||
+    block.querySelector('pre code') ||
+    block.querySelector('code');
+  if (!code) return null;
+  return code.textContent;
+}
+
+function collectArtifactBlocks(response) {
+  const out = [];
+  let codeBlocks;
+  try {
+    codeBlocks = response.querySelectorAll('code-block');
+  } catch (e) {
+    return out;
+  }
+  for (let i = 0; i < codeBlocks.length; i++) {
+    const el = codeBlocks[i];
+    const lang = classifyArtifactLanguage(el);
+    if (!lang) continue;
+    const src = extractArtifactSource(el);
+    if (src == null || !src.trim()) continue;
+    out.push({ el: el, lang: lang, src: src });
+  }
+  return out;
+}
+
+// --- Composition ------------------------------------------------------------
+
+function artifactEnsureHead(doc) {
+  if (doc.head) return doc.head;
+  const root = doc.documentElement;
+  const head = doc.createElement('head');
+  if (root) root.insertBefore(head, root.firstChild);
+  return head;
+}
+
+// Setting `.textContent` on a script element may be a TrustedScript sink
+// depending on the enforcing document. The parsed inert document should have
+// no CSP of its own, but fall back to appending a raw text node so script
+// text can never silently fail to be written.
+function artifactSetScriptText(doc, script, text) {
+  try {
+    script.textContent = text;
+    if (script.textContent === text) return;
+  } catch (e) {
+    // fall through
+  }
+  try {
+    script.appendChild(doc.createTextNode(text));
+  } catch (e) {
+    logError(e);
+  }
+}
+
+function artifactEnsureBody(doc) {
+  if (doc.body) return doc.body;
+  const root = doc.documentElement;
+  const body = doc.createElement('body');
+  if (root) root.appendChild(body);
+  return body;
+}
+
+// Build the final HTML document from the response's code blocks:
+//  - first HTML block is the document skeleton (synthesized one otherwise)
+//  - CSS blocks become <style> in <head>, JS blocks become <script> in
+//    <body>, both in original document order
+//  - the child bootstrap goes first in <head>
+//  - every <script> gets the page's live CSP nonce
+// Done via DOMParser (fed through our TrustedTypePolicy because
+// parseFromString is a TrustedHTML sink) - never regex surgery on markup.
+function composeArtifactDocument(blocks, nonce) {
+  const policy = getArtifactPolicy();
+  if (!policy) return null;
+
+  let htmlPart = null;
+  const cssParts = [];
+  const jsParts = [];
+  for (const b of blocks) {
+    if (b.lang === ARTIFACT_LANG_HTML && !htmlPart) htmlPart = b;
+    else if (b.lang === ARTIFACT_LANG_CSS) cssParts.push(b);
+    else if (b.lang === ARTIFACT_LANG_JS) jsParts.push(b);
+  }
+
+  const base = htmlPart
+    ? htmlPart.src
+    : '<!DOCTYPE html>\n<html><head><meta charset="utf-8"></head><body></body></html>';
+
+  let doc;
+  try {
+    doc = new DOMParser().parseFromString(policy.createHTML(base), 'text/html');
+  } catch (e) {
+    logError(e);
+    return null;
+  }
+  if (!doc || !doc.documentElement) return null;
+
+  try {
+    const headEl = artifactEnsureHead(doc);
+    const bodyEl = artifactEnsureBody(doc);
+
+    if (!headEl.querySelector('meta[charset]')) {
+      const meta = doc.createElement('meta');
+      meta.setAttribute('charset', 'utf-8');
+      headEl.insertBefore(meta, headEl.firstChild);
+    }
+
+    for (const c of cssParts) {
+      const style = doc.createElement('style');
+      // Keep a literal </style> inside CSS (e.g. in content strings) from
+      // terminating the block; CSS treats \\/ as an escaped slash.
+      style.textContent = String(c.src).replace(/<\/style/gi, '<\\/style');
+      headEl.appendChild(style);
+    }
+
+    for (const j of jsParts) {
+      const script = doc.createElement('script');
+      artifactSetScriptText(
+        doc,
+        script,
+        String(j.src).replace(/<\/script/gi, '<\\/script')
+      );
+      bodyEl.appendChild(script);
+    }
+
+    const boot = doc.createElement('script');
+    artifactSetScriptText(doc, boot, ARTIFACT_BOOTSTRAP_JS);
+    const first = headEl.firstElementChild;
+    headEl.insertBefore(boot, first ? first.nextSibling : null);
+
+    if (nonce) {
+      const scripts = doc.querySelectorAll('script');
+      for (let i = 0; i < scripts.length; i++) {
+        if (!scripts[i].hasAttribute('nonce')) {
+          scripts[i].setAttribute('nonce', nonce);
+        }
+      }
+    } else {
+      ipcRenderer.send(
+        'log-message',
+        '[artifact] no CSP nonce found on page - child scripts may be blocked'
+      );
+    }
+
+    const doctype = doc.doctype ? '<!DOCTYPE ' + doc.doctype.name + '>' : '<!DOCTYPE html>';
+    return doctype + doc.documentElement.outerHTML;
+  } catch (e) {
+    logError(e);
+    return null;
+  }
+}
+
+// --- Panel UI (shadow DOM, Trusted-Types-safe construction) -----------------
+
+function artifactButton(text, view) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'btn';
+  btn.setAttribute('data-view', view);
+  btn.setAttribute('aria-pressed', view === 'rendered' ? 'true' : 'false');
+  btn.textContent = text;
+  return btn;
+}
+
+function hideArtifactBlocks(entry) {
+  // Qualifying code blocks stay hidden for as long as the panel exists.
+  // Source view renders the code inside our own panel (a <pre>), so we
+  // never re-show Gemini's block: its re-render is thousands of pixels
+  // tall and used to shove the toggle bar off-screen.
+  for (const b of entry.blocks) {
+    if (!b.el || !b.el.isConnected || entry.hiddenOriginals.has(b.el)) continue;
+    entry.hiddenOriginals.set(b.el, b.el.style.display);
+    b.el.style.display = 'none';
+  }
+}
+
+// --- Source view highlighting -------------------------------------------------
+//
+// highlight.js is used ONLY as a pure string->string function
+// (hljs.highlight()), which touches no DOM and is therefore safe under
+// Gemini's Trusted Types enforcement. Its escaped HTML output travels
+// through the same TrustedTypePolicy + DOMParser path as
+// composeArtifactDocument (parseFromString is a TrustedHTML sink); spans
+// are then imported as nodes - no innerHTML anywhere. The library is
+// loaded lazily; if it can't load, Source view degrades to plain text.
+
+let artifactHljs = null;
+let artifactHljsTried = false;
+
+function getArtifactHljs() {
+  if (!artifactHljsTried) {
+    artifactHljsTried = true;
+    try {
+      artifactHljs = require('highlight.js/lib/common');
+    } catch (e) {
+      artifactHljs = null;
+      logError(e);
+    }
+  }
+  return artifactHljs;
+}
+
+// Our extracted block languages -> highlight.js grammar names.
+const ARTIFACT_HLJS_LANG = {
+  html: 'xml', // the xml grammar covers html/svg/mathml
+  css: 'css',
+  js: 'javascript',
+};
+
+function artifactHighlightFragment(lang, text) {
+  const frag = document.createDocumentFragment();
+  const plain = () => {
+    frag.appendChild(document.createTextNode(text));
+    return frag;
+  };
+
+  const hljs = getArtifactHljs();
+  const policy = getArtifactPolicy();
+  if (!hljs || !policy) return plain();
+
+  const name = ARTIFACT_HLJS_LANG[lang] || lang;
+  let html;
+  try {
+    if (!hljs.getLanguage(name)) return plain();
+    html = hljs.highlight(text, { language: name, ignoreIllegals: true }).value;
+  } catch (e) {
+    logError(e);
+    return plain();
+  }
+
+  try {
+    const parsed = new DOMParser().parseFromString(
+      policy.createHTML(html),
+      'text/html'
+    );
+    const body = parsed.body;
+    // adoptNode MOVES the node. importNode only COPIES it, which would
+    // leave body.firstChild unchanged and spin this loop forever (that
+    // froze the renderer once - do not "simplify" back to it). The bound
+    // is pure defense: exceeding it degrades to plain text, never hangs.
+    let n = 0;
+    while (body.firstChild && n++ < 200000) {
+      frag.appendChild(document.adoptNode(body.firstChild));
+    }
+    if (body.firstChild) throw new Error('artifact highlight import did not drain');
+  } catch (e) {
+    logError(e);
+    frag.textContent = '';
+    frag.appendChild(document.createTextNode(text));
+  }
+  return frag;
+}
+
+function setArtifactSourceText(entry) {
+  // Highlighted per block (each block carries its own language); the '\n\n'
+  // separators keep textContent byte-identical to the old plain join, so
+  // the Copy button still yields raw code.
+  const code = entry.sourceCode;
+  code.replaceChildren();
+  const blocks = entry.blocks;
+  for (let i = 0; i < blocks.length; i++) {
+    if (i > 0) code.appendChild(document.createTextNode('\n\n'));
+    code.appendChild(artifactHighlightFragment(blocks[i].lang, blocks[i].src));
+  }
+}
+
+function applyArtifactView(entry, view) {
+  entry.view = view;
+  entry.host.setAttribute('data-view', view);
+  entry.renderedBtn.setAttribute('aria-pressed', String(view === 'rendered'));
+  entry.sourceBtn.setAttribute('aria-pressed', String(view === 'source'));
+  entry.renderedBtn.classList.toggle('is-on', view === 'rendered');
+  entry.sourceBtn.classList.toggle('is-on', view === 'source');
+
+  // Only the panel's contents swap; the panel itself never moves.
+  const showFrame = view === 'rendered';
+  entry.iframe.style.display = showFrame ? '' : 'none';
+  entry.sourcePre.style.display = showFrame ? 'none' : '';
+}
+
+function applyArtifactDoc(entry) {
+  const policy = getArtifactPolicy();
+  if (!policy || !entry.doc) return;
+  try {
+    if (!entry.isFullscreen) {
+      entry.iframe.style.height = ARTIFACT_DEFAULT_HEIGHT + 'px';
+    }
+    entry.iframe.srcdoc = policy.createHTML(entry.doc);
+  } catch (e) {
+    logError(e);
+  }
+}
+
+function destroyArtifactEntry(entry) {
+  for (const el of Array.from(entry.hiddenOriginals.keys())) {
+    try {
+      el.style.display = entry.hiddenOriginals.get(el);
+    } catch (e) {
+      // ignore
+    }
+  }
+  entry.hiddenOriginals.clear();
+  try {
+    entry.host.remove();
+  } catch (e) {
+    // ignore
+  }
+  if (entry.frameWindow) artifactFrames.delete(entry.frameWindow);
+}
+
+// --- Fullscreen ---------------------------------------------------------------
+//
+// Gemini's chat scroller (INFINITE-SCROLLER / CHAT-WINDOW) uses
+// container-type: inline-size, which implies layout containment. Layout
+// containment creates a stacking context AND makes the element a containing
+// block for fixed descendants - so any z-index we set inside it is trapped,
+// and Gemini's header (logo, triple-dot menu) painted on top of our overlay.
+// The fix: use the Fullscreen API so the panel joins the browser's TOP
+// LAYER, which no page stacking context can beat. A pure CSS overlay stays
+// as a fallback when the API is unavailable or denied.
+
+function applyArtifactFullscreenState(entry, active) {
+  entry.isFullscreen = active;
+  if (active) {
+    // Save once: this runs from both the requestFullscreen settlement and
+    // the fullscreenchange listener; re-entering must not capture our own
+    // fullscreen cssText as the "original".
+    if (entry.savedHostCssText == null) {
+      entry.savedHostCssText = entry.host.style.cssText;
+      entry.savedFrameHeight = entry.iframe.style.height;
+    }
+    entry.host.classList.add('fullscreen-active');
+    // Inline styles beat the :host(...) stylesheet rules, so the fullscreen
+    // layout must be applied inline too (the original all:initial pins
+    // position:static and would defeat position:fixed). Max z-index helps
+    // the fallback overlay; the top layer is what really wins.
+    entry.host.style.cssText =
+      'all: initial; display: flex; flex-direction: column; box-sizing: border-box;' +
+      ' position: fixed; inset: 0; z-index: 2147483647; width: 100vw; height: 100vh;' +
+      ' margin: 0; background: rgba(0, 0, 0, 0.75);';
+    entry.iframe.style.height = '100%';
+    // replaceChildren only - innerHTML is a TrustedHTML sink and Gemini
+    // enforces require-trusted-types-for 'script'.
+    entry.fullscreenBtn.replaceChildren(iconFullscreenExit());
+    entry.fullscreenBtn.title = 'Exit fullscreen';
+  } else {
+    entry.host.classList.remove('fullscreen-active');
+    if (entry.savedHostCssText != null) {
+      entry.host.style.cssText = entry.savedHostCssText;
+      // Re-clamp against the current cap (the window may have been
+      // resized while fullscreen); fall back to the saved px height.
+      entry.iframe.style.height = entry.reportedHeight
+        ? artifactClampHeight(entry.reportedHeight) + 'px'
+        : entry.savedFrameHeight || '';
+      entry.savedHostCssText = null;
+      entry.savedFrameHeight = null;
+    }
+    entry.fullscreenBtn.replaceChildren(iconFullscreen());
+    entry.fullscreenBtn.title = 'Enter fullscreen';
+  }
+}
+
+function enterArtifactFullscreen(entry) {
+  entry.isFullscreen = true;
+  let req = null;
+  try {
+    if (entry.host.requestFullscreen) {
+      entry.fsApiRequested = true;
+      req = entry.host.requestFullscreen({ navigationUI: 'hide' });
+    }
+  } catch (e) {
+    req = null;
+  }
+  if (req && typeof req.then === 'function') {
+    req.then(
+      () => {
+        if (entry.isFullscreen) applyArtifactFullscreenState(entry, true);
+      },
+      () => {
+        // API denied/unavailable: drop to the CSS overlay fallback.
+        entry.fsApiRequested = false;
+        if (entry.isFullscreen) applyArtifactFullscreenState(entry, true);
+      }
+    );
+    return;
+  }
+  applyArtifactFullscreenState(entry, true);
+}
+
+function exitArtifactFullscreen(entry) {
+  entry.isFullscreen = false;
+  const unwind = () => applyArtifactFullscreenState(entry, false);
+  if (document.fullscreenElement === entry.host && document.exitFullscreen) {
+    let exit = null;
+    try {
+      exit = document.exitFullscreen();
+    } catch (e) {
+      exit = null;
+    }
+    if (exit && typeof exit.then === 'function') {
+      exit.then(unwind, unwind);
+      return;
+    }
+  }
+  // Fallback overlay (or fullscreen still pending - the listener unwinds
+  // the pending case once the element actually enters the top layer).
+  if (entry.host.classList.contains('fullscreen-active')) unwind();
+}
+
+function createArtifactEntry(response, blocks) {
+  const host = document.createElement('div');
+  host.setAttribute(ARTIFACT_PANEL_ATTR, '1');
+  // Inline styles so no page rule can affect the host's layout.
+  host.style.cssText =
+    'all: initial; display: block; width: 100%; box-sizing: border-box; margin: 12px 0;';
+
+  const shadow = host.attachShadow({ mode: 'open' });
+
+  const style = document.createElement('style');
+  style.textContent = ARTIFACT_STYLES;
+  shadow.appendChild(style);
+
+  const bar = document.createElement('div');
+  bar.className = 'bar';
+  bar.setAttribute('role', 'group');
+  bar.setAttribute('aria-label', 'Artifact view');
+
+  const label = document.createElement('span');
+  label.className = 'label';
+  label.textContent = 'Artifact';
+
+  const seg = document.createElement('div');
+  seg.className = 'seg';
+  const renderedBtn = artifactButton('Rendered', 'rendered');
+  const sourceBtn = artifactButton('Source', 'source');
+  seg.appendChild(renderedBtn);
+  seg.appendChild(sourceBtn);
+
+  bar.appendChild(label);
+  bar.appendChild(seg);
+  shadow.appendChild(bar);
+
+  const wrap = document.createElement('div');
+  wrap.className = 'wrap';
+  const iframe = document.createElement('iframe');
+  iframe.className = 'frame';
+  // Sandbox: scripts only. No allow-same-origin, no allow-top-navigation.
+  iframe.setAttribute('sandbox', 'allow-scripts');
+  iframe.setAttribute('title', 'Rendered artifact');
+  wrap.appendChild(iframe);
+
+  // Source view: the code lives here (inside our panel) instead of
+  // re-showing Gemini's code block - see hideArtifactBlocks().
+  const sourcePre = document.createElement('pre');
+  sourcePre.className = 'src';
+  sourcePre.style.display = 'none';
+  sourcePre.setAttribute('aria-label', 'Artifact source code');
+  const sourceCode = document.createElement('code');
+  sourcePre.appendChild(sourceCode);
+  wrap.appendChild(sourcePre);
+  shadow.appendChild(wrap);
+
+  const copyBtn = document.createElement('button');
+  copyBtn.type = 'button';
+  copyBtn.className = 'btn copy';
+  copyBtn.textContent = 'Copy';
+  copyBtn.setAttribute('aria-label', 'Copy artifact source');
+  copyBtn.title = 'Copy source';
+
+  const fullscreenBtn = document.createElement('button');
+  fullscreenBtn.type = 'button';
+  fullscreenBtn.className = 'btn fullscreen';
+  fullscreenBtn.title = 'Enter fullscreen';
+  fullscreenBtn.setAttribute('aria-label', 'Toggle fullscreen');
+  fullscreenBtn.appendChild(iconFullscreen());
+
+  const entry = {
+    host: host,
+    wrap: wrap,
+    iframe: iframe,
+    sourcePre: sourcePre,
+    sourceCode: sourceCode,
+    renderedBtn: renderedBtn,
+    sourceBtn: sourceBtn,
+    copyBtn: copyBtn,
+    fullscreenBtn: fullscreenBtn,
+    view: 'rendered',
+    blocks: blocks,
+    contentKey: null,
+    doc: null,
+    hiddenOriginals: new Map(),
+    isFullscreen: false,
+    fsApiRequested: false,
+    reportedHeight: 0,
+  };
+
+  // Clicks on our controls must not reach Gemini's document-level handlers.
+  const stop = (e) => e.stopPropagation();
+  bar.addEventListener('click', stop);
+  renderedBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    applyArtifactView(entry, 'rendered');
+  });
+  sourceBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    applyArtifactView(entry, 'source');
+  });
+  copyBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const text = sourceCode.textContent || '';
+    const done = () => {
+      copyBtn.textContent = 'Copied';
+      setTimeout(() => {
+        copyBtn.textContent = 'Copy';
+      }, 1200);
+    };
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, () => {});
+      }
+    } catch (err) {
+      // ignore - clipboard may be unavailable
+    }
+  });
+  fullscreenBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (entry.isFullscreen) {
+      exitArtifactFullscreen(entry);
+    } else {
+      enterArtifactFullscreen(entry);
+    }
+  });
+  seg.appendChild(copyBtn);
+  seg.appendChild(fullscreenBtn);
+
+  // Place the panel right after the wrapper of the last qualifying code
+  // block, inside the markdown flow (never re-parent Gemini's nodes).
+  const lastBlock = blocks[blocks.length - 1].el;
+  const anchor =
+    (lastBlock.closest && lastBlock.closest('response-element')) || lastBlock;
+  const parent = anchor.parentNode;
+  if (parent) parent.insertBefore(host, anchor.nextSibling);
+  else document.body.appendChild(host);
+
+  entry.frameWindow = iframe.contentWindow;
+  artifactFrames.set(entry.frameWindow, entry);
+  hideArtifactBlocks(entry);
+  applyArtifactView(entry, 'rendered');
+  return entry;
+}
+
+// --- Processing pass --------------------------------------------------------
+
+function sameArtifactBlocks(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].el !== b[i].el || a[i].lang !== b[i].lang || a[i].src !== b[i].src) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function artifactContentKey(blocks) {
+  // Exact string compare (no hashing) - keeps updates collision-free.
+  const parts = new Array(blocks.length);
+  for (let i = 0; i < blocks.length; i++) {
+    parts[i] = blocks[i].lang + '\u0000' + blocks[i].src;
+  }
+  return blocks.length + '\u0000' + parts.join('\u0001');
+}
+
+function processArtifactResponse(response) {
+  const blocks = collectArtifactBlocks(response);
+  const entry = artifactPanels.get(response);
+
+  if (blocks.length === 0) {
+    if (entry) {
+      destroyArtifactEntry(entry);
+      artifactPanels.delete(response);
+    }
+    return;
+  }
+
+  const contentKey = artifactContentKey(blocks);
+  if (
+    entry &&
+    entry.host.isConnected &&
+    entry.contentKey === contentKey &&
+    sameArtifactBlocks(entry.blocks, blocks)
+  ) {
+    return; // nothing changed
+  }
+
+  let target = entry;
+  if (!target || !target.host.isConnected) {
+    if (target) destroyArtifactEntry(target);
+    target = createArtifactEntry(response, blocks);
+    artifactPanels.set(response, target);
+  }
+
+  const docChanged = target.contentKey !== contentKey;
+  target.blocks = blocks;
+  target.contentKey = contentKey;
+
+  // Gemini may replace code-block nodes on re-render; hide any new ones.
+  hideArtifactBlocks(target);
+
+  if (docChanged) {
+    const doc = composeArtifactDocument(blocks, getArtifactNonce());
+    if (doc) {
+      target.doc = doc;
+      applyArtifactDoc(target);
+    }
+    // Keep the Source view in sync with the blocks (syntax-highlighted).
+    setArtifactSourceText(target);
+  }
+  applyArtifactView(target, target.view);
+}
+
+function pruneArtifactFrames() {
+  for (const [win, entry] of artifactFrames) {
+    if (!entry.iframe || !entry.iframe.isConnected) artifactFrames.delete(win);
+  }
+}
+
+function runArtifactPass() {
+  let responses;
+  try {
+    responses = document.querySelectorAll('model-response');
+  } catch (e) {
+    logError(e);
+    return;
+  }
+  for (let i = 0; i < responses.length; i++) {
+    try {
+      processArtifactResponse(responses[i]);
+    } catch (e) {
+      logError(e);
+    }
+  }
+  pruneArtifactFrames();
+  // New panels are created after the theme observer may have run - re-apply
+  // on every pass so freshly injected hosts get the right theme.
+  try {
+    applyArtifactTheme();
+  } catch (e) {
+    logError(e);
+  }
+}
+
+function scheduleArtifactPass(delay) {
+  if (artifactTimer) {
+    clearTimeout(artifactTimer);
+    artifactTimer = null;
+  }
+  artifactTimer = setTimeout(
+    guard(() => {
+      artifactTimer = null;
+      const since = Date.now() - artifactLastMutationAt;
+      if (since < ARTIFACT_SETTLE_MS) {
+        // Still mutating (streaming) - wait for quiet before rebuilding so
+        // the rendered document is not re-executed per chunk.
+        scheduleArtifactPass(ARTIFACT_SETTLE_MS - since);
+        return;
+      }
+      runArtifactPass();
+    }),
+    delay
+  );
+}
+
+function artifactMutationIsOurs(record) {
+  const node =
+    record.target && record.target.nodeType === 1
+      ? record.target
+      : record.target
+        ? record.target.parentElement
+        : null;
+  return !!(
+    node &&
+    node.closest &&
+    node.closest('[' + ARTIFACT_PANEL_ATTR + ']')
+  );
+}
+
+function startArtifactObserver() {
+  if (artifactObserver || !window.MutationObserver || !document.body) return;
+  artifactLastMutationAt = Date.now();
+  artifactObserver = new MutationObserver(
+    guard((records) => {
+      let ours = 0;
+      for (const r of records) {
+        if (artifactMutationIsOurs(r)) ours++;
+      }
+      if (ours === records.length) return; // our own panel mutations
+      artifactLastMutationAt = Date.now();
+      scheduleArtifactPass(ARTIFACT_DEBOUNCE_MS);
+    })
+  );
+  artifactObserver.observe(document.body, MUTATION_OPTIONS);
+  // Build panels for anything already on the page.
+  scheduleArtifactPass(ARTIFACT_DEBOUNCE_MS);
+}
+
+// --- Fullscreen sync (Escape exits the top layer natively) --------------------
+
+document.addEventListener(
+  'fullscreenchange',
+  guard(() => {
+    const fsEl = document.fullscreenElement;
+    for (const [, entry] of artifactFrames) {
+      const inFs = fsEl === entry.host;
+      if (inFs) {
+        if (!entry.isFullscreen) {
+          // UI state already says windowed (exit clicked while the enter
+          // request was still pending): unwind so visuals match the button.
+          try {
+            document.exitFullscreen();
+          } catch (e) {
+            // ignore
+          }
+        } else {
+          applyArtifactFullscreenState(entry, true);
+        }
+      } else if (entry.isFullscreen && entry.fsApiRequested) {
+        // Native exit (Escape) while we believed we were fullscreen.
+        entry.fsApiRequested = false;
+        applyArtifactFullscreenState(entry, false);
+      }
+    }
+  })
+);
+
+// --- Height reporting (child -> parent) -------------------------------------
+
+function artifactMaxHeight() {
+  return Math.max(
+    ARTIFACT_MIN_HEIGHT,
+    Math.min(
+      ARTIFACT_MAX_HEIGHT,
+      Math.floor(window.innerHeight * ARTIFACT_MAX_VIEWPORT_FRACTION)
+    )
+  );
+}
+
+function artifactClampHeight(h) {
+  return Math.max(
+    ARTIFACT_MIN_HEIGHT,
+    Math.min(artifactMaxHeight(), Math.round(h))
+  );
+}
+
+window.addEventListener(
+  'message',
+  guard((ev) => {
+    const data = ev.data;
+    if (!data || data.gdArtifact !== 'height') return;
+    // Only accept height reports from iframes we created ourselves.
+    const entry = artifactFrames.get(ev.source);
+    if (!entry || !entry.iframe || !entry.iframe.isConnected) return;
+    const h = Number(data.h);
+    if (!isFinite(h) || h <= 0) return;
+    // Raw child value kept so window resizes can re-clamp against the
+    // viewport-relative cap without waiting for a new report.
+    entry.reportedHeight = h;
+    // While fullscreen, the iframe is sized by CSS (100%); don't override.
+    if (entry.isFullscreen) return;
+    entry.iframe.style.height = artifactClampHeight(h) + 'px';
+  })
+);
+
+window.addEventListener(
+  'resize',
+  guard(() => {
+    for (const [, entry] of artifactFrames) {
+      if (entry.isFullscreen || !entry.reportedHeight) continue;
+      entry.iframe.style.height =
+        artifactClampHeight(entry.reportedHeight) + 'px';
+    }
+  })
+);
+
+// --- Theme (mirrors the find bar's detection) -------------------------------
+
+function applyArtifactTheme() {
+  let isDark = false;
+  const html = document.documentElement;
+  const body = document.body;
+  const htmlTheme = html && html.getAttribute('data-theme');
+  if (htmlTheme) isDark = htmlTheme.toLowerCase() === 'dark';
+  if (!isDark && body) {
+    const cls = body.classList;
+    if (cls.contains('dark') || cls.contains('dark-theme') || cls.contains('theme-dark')) {
+      isDark = true;
+    }
+  }
+  if (!isDark) {
+    try {
+      isDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    } catch (e) {
+      isDark = false;
+    }
+  }
+  document
+    .querySelectorAll('[' + ARTIFACT_PANEL_ATTR + ']')
+    .forEach((h) => h.setAttribute('data-theme', isDark ? 'dark' : 'light'));
+}
+
+let artifactThemeObserver = null;
+function startArtifactThemeObserver() {
+  if (artifactThemeObserver) return;
+  if (!window.MutationObserver) return;
+  artifactThemeObserver = new MutationObserver(guard(applyArtifactTheme));
+  if (document.documentElement) {
+    artifactThemeObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['data-theme', 'class'],
+    });
+  }
+  if (document.body) {
+    artifactThemeObserver.observe(document.body, {
+      attributes: true,
+      attributeFilter: ['class'],
+    });
+  }
+  try {
+    if (window.matchMedia) {
+      const mq = window.matchMedia('(prefers-color-scheme: dark)');
+      if (mq.addEventListener) mq.addEventListener('change', guard(applyArtifactTheme));
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
+// New panels are created after the theme observer may have run - re-apply on
+// every pass so freshly injected hosts get the right theme.
+
+// --- Init -------------------------------------------------------------------
+
+(function initArtifactPreview() {
+  const start = guard(() => {
+    if (!document.body) return;
+    applyArtifactTheme();
+    startArtifactThemeObserver();
+    startArtifactObserver();
+  });
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start, { once: true });
+  } else {
+    start();
+  }
+})();
