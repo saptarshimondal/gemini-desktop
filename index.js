@@ -165,7 +165,7 @@ function createWindow () {
     show: isScreenshotMode ? false : !isTray, // Start hidden if --tray or screenshot mode
     webPreferences: {
       preload: join(__dirname, 'preload.js'),
-      nodeIntegration: false,
+      nodeIntegration: true,
       contextIsolation: true,
       sandbox: false
     }
