@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.9.0](https://github.com/saptarshimondal/gemini-desktop/compare/gemini-desktop-v0.8.1...gemini-desktop-v0.9.0) (2026-10-20)
+
+
+### Features
+
+* artifect fullscreen toggle implemented ([8927741](https://github.com/saptarshimondal/gemini-desktop/commit/8927741804159adcea5cf83f606370a3c20eeee0))
+* code highlighting in artifect source tab ([12f4c6c](https://github.com/saptarshimondal/gemini-desktop/commit/12f4c6cf43b43d18ea9a79e21b1feb951fcd90c4))
+* implement artifect preview feature for html / js / css interactive demo ([3437707](https://github.com/saptarshimondal/gemini-desktop/commit/3437707526c88a1e4498caa23a3434277757714d))
+
+
+### Bug Fixes
+
+* artifect fullscreen css issues ([84e493e](https://github.com/saptarshimondal/gemini-desktop/commit/84e493e22b31685ad0a45ff2d288b91be4f72522))
+* artifect preview button gets hidden after clicking on source button ([dfedf80](https://github.com/saptarshimondal/gemini-desktop/commit/dfedf8099630898c8311863552f89d2409a7b76d))
+
 ## [0.8.1](https://github.com/saptarshimondal/gemini-desktop/compare/gemini-desktop-v0.8.0...gemini-desktop-v0.8.1) (2026-10-18)
 
 
