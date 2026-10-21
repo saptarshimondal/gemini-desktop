@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/saptarshimondal/gemini-desktop/compare/gemini-desktop-v0.9.0...gemini-desktop-v0.9.1) (2026-10-21)
+
+
+### Bug Fixes
+
+* showing artifact only when llm produces full html document ([8769bf7](https://github.com/saptarshimondal/gemini-desktop/commit/8769bf78b218f7102258cf3986e71a0dfee9ed4e))
+
 ## [0.9.0](https://github.com/saptarshimondal/gemini-desktop/compare/gemini-desktop-v0.8.1...gemini-desktop-v0.9.0) (2026-10-20)
 
 
