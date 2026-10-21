@@ -1853,13 +1853,31 @@ function extractArtifactSource(block) {
   return code.textContent;
 }
 
+// --- Snippet filter: artifacts are full HTML documents only ------------------
+//
+// A Gemini answer that merely SHOWS code (a div fragment, a CSS snippet, a
+// standalone script) must keep its normal code block - there is no page to
+// preview, and an empty composed skeleton would just render blank.
+// An artifact exists only when the answer contains a real HTML document:
+// case-insensitive <html...> AND </html>. <!DOCTYPE html> is optional and
+// irrelevant either way. CSS/JS blocks in that same answer are the page's
+// styles/scripts and merge into the artifact; HTML fragments never do
+// (only a full document may act as the skeleton).
+
+function artifactHtmlLooksLikeDocument(src) {
+  // Ignore HTML comments: a snippet that merely MENTIONS <html> inside
+  // <!-- ... --> must not qualify as a document.
+  const s = String(src).replace(/<!--[\s\S]*?-->/g, ' ');
+  return /<html[\s>]/i.test(s) && /<\/html\s*>/i.test(s);
+}
+
 function collectArtifactBlocks(response) {
-  const out = [];
+  const candidates = [];
   let codeBlocks;
   try {
     codeBlocks = response.querySelectorAll('code-block');
   } catch (e) {
-    return out;
+    return candidates;
   }
   for (let i = 0; i < codeBlocks.length; i++) {
     const el = codeBlocks[i];
@@ -1867,7 +1885,33 @@ function collectArtifactBlocks(response) {
     if (!lang) continue;
     const src = extractArtifactSource(el);
     if (src == null || !src.trim()) continue;
-    out.push({ el: el, lang: lang, src: src });
+    candidates.push({ el: el, lang: lang, src: src });
+  }
+
+  // Snippet filter (see above): without a full HTML document there is no
+  // artifact at all - CSS/JS blocks only ever merge into a qualifying page.
+  let hasFullHtml = false;
+  for (let i = 0; i < candidates.length; i++) {
+    if (
+      candidates[i].lang === ARTIFACT_LANG_HTML &&
+      artifactHtmlLooksLikeDocument(candidates[i].src)
+    ) {
+      hasFullHtml = true;
+      break;
+    }
+  }
+  if (!hasFullHtml) return [];
+
+  const out = [];
+  for (let i = 0; i < candidates.length; i++) {
+    const b = candidates[i];
+    if (b.lang === ARTIFACT_LANG_HTML) {
+      // Only a full document may be the artifact skeleton.
+      if (artifactHtmlLooksLikeDocument(b.src)) out.push(b);
+    } else {
+      // CSS/JS belongs to the page.
+      out.push(b);
+    }
   }
   return out;
 }
